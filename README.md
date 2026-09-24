@@ -118,7 +118,7 @@ flowchart TD
         Q3[JEV judgment C]
         QN[JEV judgment ...]
 
-        JA -.-> QN
+        JA ~~~ QN
     end
 
     JP --> Q1
@@ -146,7 +146,7 @@ flowchart TD
     E --> Q[Outcome verifier]
     Q --> O
 
-    T[Trace / replay]
+    T["Trace / replay<br/>(causal path)"]
     N -.-> T
     JB -.-> T
     Q -.-> T
