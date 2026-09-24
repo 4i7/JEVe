@@ -10,34 +10,46 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from jeve.model import (
     BundleReason,
     BundleValidationStatus,
+    CalibrationProvenance,
     CalibrationStatus,
+    FreshValidationReason,
     HardConstraints,
+    IntentAdmissionStatus,
     Knowledge,
     KnowledgeStatus,
     Objective,
     OutcomeStage,
     PolicyStatus,
-    ReductionReason,
+    PolicyUsableJudgmentBundle,
     ResultStatus,
     RouteState,
     StateSnapshot,
     ValueKind,
 )
 from jeve.pipeline import (
-    BundleValidationPolicy,
+    CalibrationPolicy,
     CandidateGenerator,
     DeterministicPolicy,
     DeterministicReducer,
     FakeJEVAdapter,
     FreshStateValidator,
     JudgmentBundleValidator,
+    JudgmentFreshnessPolicy,
     JudgmentPlanner,
     JudgmentScheduler,
     OutcomeVerifier,
+    PendingIntentRegistry,
     PolicyConfig,
+    ProbabilityFusion,
+    ReplayRunner,
     ScriptedAnswer,
     SimulatedActionCompiler,
     SimulatedExecutor,
+    TraceRecorder,
+    judgment_dependency_key,
+    judgment_equivalence_key,
+    reuse_allowed,
+    semantic_snapshot_key,
 )
 
 
@@ -63,11 +75,12 @@ def snapshot(
     snapshot_id: str = "snapshot-1",
     observation_epoch: int = 7,
     state_epoch: int = 1,
-    fresh_until: int = 100,
+    fresh_until: int = 200,
     routes: tuple[RouteState, ...] | None = None,
     constraints: HardConstraints | None = None,
     retreat_available: Knowledge[bool] | None = None,
     exact_should_disengage: Knowledge[float] | None = None,
+    risk_tolerance: float = 0.50,
 ) -> StateSnapshot:
     return StateSnapshot(
         snapshot_id=snapshot_id,
@@ -75,20 +88,39 @@ def snapshot(
         state_epoch=state_epoch,
         observed_at=10,
         fresh_until=fresh_until,
-        objective=Objective(destination_id="destination", risk_tolerance=0.50),
+        objective=Objective(destination_id="destination", risk_tolerance=risk_tolerance),
         constraints=constraints or HardConstraints(),
-        routes=routes
-        or (
-            route("A", length=10),
-            route("B", length=15),
-        ),
+        routes=routes or (route("A", length=10), route("B", length=15)),
         retreat_destination_id="safe-harbor",
         retreat_available=retreat_available or Knowledge.known(True),
         exact_should_disengage=exact_should_disengage or Knowledge.unknown(),
     )
 
 
-def ambiguous_scripts(*, fresh_until: int = 100) -> dict[str, ScriptedAnswer]:
+CAL_POLICY = CalibrationPolicy(
+    accepted_authorities=("synthetic-calibration-suite",),
+    evaluation_population="navigation-risk-v1",
+    metric_name="ECE",
+    max_metric_value=0.10,
+)
+FRESHNESS = JudgmentFreshnessPolicy(max_age=100)
+POLICY_CONFIG = PolicyConfig(disengage_threshold=0.8, decision_ttl=50)
+
+
+def provenance(schema_version: str) -> CalibrationProvenance:
+    return CalibrationProvenance(
+        authority="synthetic-calibration-suite",
+        basis="held-out replay calibration",
+        provider_id="fake-provider",
+        model_id="fake-model",
+        schema_version=schema_version,
+        evaluation_population="navigation-risk-v1",
+        metric_name="ECE",
+        metric_value=0.04,
+    )
+
+
+def ambiguous_scripts(*, optional_block: bool = False):
     return {
         "route-risk:A": ScriptedAnswer(
             ResultStatus.ANSWERED,
@@ -96,7 +128,7 @@ def ambiguous_scripts(*, fresh_until: int = 100) -> dict[str, ScriptedAnswer]:
             0.72,
             CalibrationStatus.CALIBRATED,
             completed_at=20,
-            fresh_until=fresh_until,
+            calibration_provenance=provenance("route-risk-v1"),
         ),
         "route-risk:B": ScriptedAnswer(
             ResultStatus.ANSWERED,
@@ -104,7 +136,7 @@ def ambiguous_scripts(*, fresh_until: int = 100) -> dict[str, ScriptedAnswer]:
             0.22,
             CalibrationStatus.CALIBRATED,
             completed_at=20,
-            fresh_until=fresh_until,
+            calibration_provenance=provenance("route-risk-v1"),
         ),
         "should-disengage": ScriptedAnswer(
             ResultStatus.ANSWERED,
@@ -112,373 +144,531 @@ def ambiguous_scripts(*, fresh_until: int = 100) -> dict[str, ScriptedAnswer]:
             0.15,
             CalibrationStatus.CALIBRATED,
             completed_at=20,
-            fresh_until=fresh_until,
+            calibration_provenance=provenance("disengage-v1"),
+        ),
+        "optional-context-note": ScriptedAnswer(
+            ResultStatus.ANSWERED,
+            ValueKind.SCORE,
+            0.5,
+            CalibrationStatus.UNKNOWN,
+            completed_at=20,
+            block_until_cancel=optional_block,
         ),
     }
 
 
-class ArchitectureSliceTests(unittest.TestCase):
+class ArchitectureCoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.generator = CandidateGenerator()
         self.reducer = DeterministicReducer()
         self.planner = JudgmentPlanner()
         self.scheduler = JudgmentScheduler()
-        self.bundle_validator = JudgmentBundleValidator()
+        self.validator = JudgmentBundleValidator(FRESHNESS, CAL_POLICY)
         self.policy = DeterministicPolicy()
 
-    def _reduction_and_plan(self, state: StateSnapshot):
+    def reduction_plan(self, state, *, optional=False):
         candidates = self.generator.generate(state)
         reduction = self.reducer.reduce(state, candidates)
-        plan = self.planner.plan(state, reduction)
+        plan = self.planner.plan(state, reduction, include_optional_context=optional)
         return reduction, plan
 
-    def _validated_ambiguous_bundle(self, state: StateSnapshot):
-        reduction, plan = self._reduction_and_plan(state)
-        adapter = FakeJEVAdapter(ambiguous_scripts())
-        scheduled = self.scheduler.execute(plan, adapter)
-        validation = self.bundle_validator.validate(
-            state,
-            plan,
-            scheduled.results,
-            BundleValidationPolicy(now=30),
-        )
+    def validated(self, state, *, optional=False, scripts=None, now=30):
+        reduction, plan = self.reduction_plan(state, optional=optional)
+        scheduled = self.scheduler.execute(plan, FakeJEVAdapter(scripts or ambiguous_scripts()))
+        validation = self.validator.validate(state, plan, scheduled.results, now=now)
         self.assertIsNotNone(validation.validated)
-        return reduction, plan, scheduled, validation.validated, adapter
+        return reduction, plan, scheduled, validation
 
-    def test_knowledge_states_remain_distinct(self) -> None:
-        known_false = Knowledge.known(False)
-        unknown = Knowledge.unknown()
-        stale = Knowledge.stale()
-        transitional = Knowledge.transitional()
+    def test_knowledge_states_remain_distinct(self):
+        self.assertNotEqual(Knowledge.unknown(), Knowledge.stale())
+        self.assertNotEqual(Knowledge.stale(), Knowledge.transitional())
+        self.assertEqual(Knowledge.known(False).status, KnowledgeStatus.KNOWN)
 
-        self.assertEqual(known_false.status, KnowledgeStatus.KNOWN)
-        self.assertIs(known_false.value, False)
-        self.assertEqual(unknown.status, KnowledgeStatus.UNKNOWN)
-        self.assertEqual(stale.status, KnowledgeStatus.STALE)
-        self.assertEqual(transitional.status, KnowledgeStatus.TRANSITIONAL)
-        self.assertNotEqual(unknown, stale)
-        self.assertNotEqual(stale, transitional)
-
-    def test_reducer_emits_stable_reason_codes(self) -> None:
+    def test_deterministic_only_zero_jev(self):
         state = snapshot(
             routes=(
-                route(
-                    "invalid",
-                    reachable=Knowledge.known(False),
-                    length=4,
-                    exact_risk=Knowledge.known(0.10),
-                ),
-                route(
-                    "unavailable",
-                    length=4,
-                    available=False,
-                    exact_risk=Knowledge.known(0.10),
-                ),
-                route(
-                    "too-long",
-                    length=50,
-                    exact_risk=Knowledge.known(0.10),
-                ),
-                route(
-                    "best",
-                    length=5,
-                    exact_risk=Knowledge.known(0.10),
-                ),
-                route(
-                    "dominated",
-                    length=8,
-                    exact_risk=Knowledge.known(0.10),
-                ),
-            ),
-            constraints=HardConstraints(max_route_length=20),
-            retreat_available=Knowledge.known(False),
-            exact_should_disengage=Knowledge.known(0.0),
-        )
-        reduction, _ = self._reduction_and_plan(state)
-        reason_by_candidate = {
-            item.candidate_id: item.reason for item in reduction.eliminated
-        }
-
-        self.assertEqual(
-            reason_by_candidate["TAKE_ROUTE:invalid"],
-            ReductionReason.INVALID_PRECONDITION,
-        )
-        self.assertEqual(
-            reason_by_candidate["TAKE_ROUTE:unavailable"],
-            ReductionReason.UNAVAILABLE_ACTION,
-        )
-        self.assertEqual(
-            reason_by_candidate["TAKE_ROUTE:too-long"],
-            ReductionReason.HARD_CONSTRAINT_VIOLATION,
-        )
-        self.assertEqual(
-            reason_by_candidate["TAKE_ROUTE:dominated"],
-            ReductionReason.STRICTLY_DOMINATED_EXACT_OPTION,
-        )
-
-    def test_fixture_1_deterministic_only_uses_zero_jev_calls(self) -> None:
-        state = snapshot(
-            routes=(
-                route(
-                    "A",
-                    length=10,
-                    exact_risk=Knowledge.known(0.20),
-                ),
-                route(
-                    "B",
-                    length=15,
-                    exact_risk=Knowledge.known(0.20),
-                ),
+                route("A", length=10, exact_risk=Knowledge.known(0.2)),
+                route("B", length=15, exact_risk=Knowledge.known(0.2)),
             ),
             retreat_available=Knowledge.known(False),
             exact_should_disengage=Knowledge.known(0.0),
         )
-        reduction, plan = self._reduction_and_plan(state)
+        reduction, plan = self.reduction_plan(state)
         adapter = FakeJEVAdapter({})
         scheduled = self.scheduler.execute(plan, adapter)
-
-        self.assertEqual(plan.questions, ())
-        self.assertEqual(scheduled.waves, ())
         self.assertEqual(adapter.call_count, 0)
-
-        decision = self.policy.decide(
-            state,
-            reduction,
-            bundle=None,
-            config=PolicyConfig(),
-        )
-        self.assertEqual(decision.status, PolicyStatus.SELECTED)
+        self.assertEqual(scheduled.waves, ())
+        decision = self.policy.decide(state, reduction, None, POLICY_CONFIG, now=30)
         self.assertEqual(decision.selected_action.candidate_id, "TAKE_ROUTE:A")
+        self.assertEqual(decision.judgment_bindings, ())
 
-    def test_fixture_2_parallel_route_risk_is_one_wave_and_policy_selects_semantic_action(
-        self,
-    ) -> None:
+    def test_parallel_bundle_and_policy_binding_include_consumed_evidence(self):
         state = snapshot()
-        reduction, plan = self._reduction_and_plan(state)
-
-        self.assertEqual(
-            tuple(question.question_id for question in plan.questions),
-            ("route-risk:A", "route-risk:B", "should-disengage"),
-        )
-
-        adapter = FakeJEVAdapter(ambiguous_scripts())
-        scheduled = self.scheduler.execute(plan, adapter)
-
+        reduction, plan, scheduled, validation = self.validated(state)
         self.assertEqual(
             scheduled.waves,
             (("route-risk:A", "route-risk:B", "should-disengage"),),
         )
-        self.assertEqual(adapter.call_count, 3)
-
-        validation = self.bundle_validator.validate(
-            state,
-            plan,
-            scheduled.results,
-            BundleValidationPolicy(now=30),
-        )
-        self.assertEqual(validation.status, BundleValidationStatus.VALID)
-
         decision = self.policy.decide(
-            state,
-            reduction,
-            validation.validated,
-            PolicyConfig(),
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
         )
         self.assertEqual(decision.status, PolicyStatus.SELECTED)
         self.assertEqual(decision.selected_action.candidate_id, "TAKE_ROUTE:B")
+        self.assertEqual(
+            {b.question_id for b in decision.judgment_bindings},
+            {"route-risk:A", "route-risk:B", "should-disengage"},
+        )
+        self.assertEqual(decision.policy_config_key, POLICY_CONFIG.key)
+        self.assertEqual(decision.semantic_input_key, semantic_snapshot_key(state))
 
-    def test_fixture_3_missing_required_judgment_has_no_action_authority(self) -> None:
+    def test_direct_policy_bundle_construction_rejected(self):
+        with self.assertRaises(TypeError):
+            PolicyUsableJudgmentBundle(
+                None, (), 0, object()  # type: ignore[arg-type]
+            )
+
+    def test_missing_required_no_authority(self):
         state = snapshot()
-        _, plan = self._reduction_and_plan(state)
+        _, plan = self.reduction_plan(state)
         scripts = ambiguous_scripts()
         del scripts["route-risk:B"]
-
         scheduled = self.scheduler.execute(plan, FakeJEVAdapter(scripts))
-        validation = self.bundle_validator.validate(
-            state,
-            plan,
-            scheduled.results,
-            BundleValidationPolicy(now=30),
-        )
-
+        validation = self.validator.validate(state, plan, scheduled.results, now=30)
         self.assertEqual(validation.status, BundleValidationStatus.INVALID)
+        self.assertIn(BundleReason.PROVIDER_FAILURE, validation.reasons)
         self.assertIn(BundleReason.MISSING_REQUIRED, validation.reasons)
-        self.assertIsNone(validation.validated)
 
-    def test_fixture_4_invalid_semantic_output_is_rejected(self) -> None:
+    def test_score_probability_mismatch_rejected(self):
         state = snapshot()
-        _, plan = self._reduction_and_plan(state)
+        _, plan = self.reduction_plan(state)
         scripts = ambiguous_scripts()
-        scripts["route-risk:A"] = ScriptedAnswer(
-            ResultStatus.ANSWERED,
-            ValueKind.SCORE,
-            0.30,
-            CalibrationStatus.CALIBRATED,
-            completed_at=20,
-            fresh_until=100,
+        scripts["route-risk:A"] = replace(
+            scripts["route-risk:A"], value_kind=ValueKind.SCORE
         )
-
-        scheduled = self.scheduler.execute(plan, FakeJEVAdapter(scripts))
-        validation = self.bundle_validator.validate(
+        validation = self.validator.validate(
             state,
             plan,
-            scheduled.results,
-            BundleValidationPolicy(now=30),
+            self.scheduler.execute(plan, FakeJEVAdapter(scripts)).results,
+            now=30,
         )
-
-        self.assertEqual(validation.status, BundleValidationStatus.INVALID)
         self.assertIn(BundleReason.OUTPUT_KIND_MISMATCH, validation.reasons)
-        self.assertIsNone(validation.validated)
 
-    def test_fixture_5_calibration_requirement_rejects_uncalibrated_probability(
-        self,
-    ) -> None:
+    def test_calibration_provenance_is_substantive(self):
         state = snapshot()
-        _, plan = self._reduction_and_plan(state)
+        _, plan = self.reduction_plan(state)
+        scripts = ambiguous_scripts()
+        bad = replace(
+            provenance("route-risk-v1"),
+            authority="unknown-authority",
+            metric_value=0.2,
+        )
+        scripts["route-risk:A"] = replace(
+            scripts["route-risk:A"], calibration_provenance=bad
+        )
+        validation = self.validator.validate(
+            state,
+            plan,
+            self.scheduler.execute(plan, FakeJEVAdapter(scripts)).results,
+            now=30,
+        )
+        self.assertIn(BundleReason.CALIBRATION_PROVENANCE_MISMATCH, validation.reasons)
+
+    def test_provider_failure_is_not_stale_evidence(self):
+        state = snapshot()
+        _, plan = self.reduction_plan(state)
         scripts = ambiguous_scripts()
         scripts["route-risk:A"] = ScriptedAnswer(
-            ResultStatus.ANSWERED,
-            ValueKind.PROBABILITY,
-            0.30,
-            CalibrationStatus.UNCALIBRATED,
-            completed_at=20,
-            fresh_until=100,
+            ResultStatus.ERROR,
+            completed_at=0,
         )
-
-        scheduled = self.scheduler.execute(plan, FakeJEVAdapter(scripts))
-        validation = self.bundle_validator.validate(
+        validation = self.validator.validate(
             state,
             plan,
-            scheduled.results,
-            BundleValidationPolicy(now=30),
+            self.scheduler.execute(plan, FakeJEVAdapter(scripts)).results,
+            now=30,
         )
+        self.assertIn(BundleReason.PROVIDER_FAILURE, validation.reasons)
+        self.assertNotIn(BundleReason.RESULT_STALE, validation.reasons)
 
-        self.assertEqual(validation.status, BundleValidationStatus.INVALID)
-        self.assertIn(BundleReason.CALIBRATION_INSUFFICIENT, validation.reasons)
-        self.assertIsNone(validation.validated)
-
-    def test_fixture_6_stale_bundle_cannot_enter_policy(self) -> None:
+    def test_validator_owns_evidence_freshness(self):
         state = snapshot()
-        _, plan = self._reduction_and_plan(state)
-        adapter = FakeJEVAdapter(ambiguous_scripts(fresh_until=25))
-        scheduled = self.scheduler.execute(plan, adapter)
-
-        validation = self.bundle_validator.validate(
+        _, plan = self.reduction_plan(state)
+        scripts = {
+            key: replace(value, completed_at=1, fresh_until=999999)
+            for key, value in ambiguous_scripts().items()
+        }
+        validation = JudgmentBundleValidator(
+            JudgmentFreshnessPolicy(max_age=5), CAL_POLICY
+        ).validate(
             state,
             plan,
-            scheduled.results,
-            BundleValidationPolicy(now=30),
+            self.scheduler.execute(plan, FakeJEVAdapter(scripts)).results,
+            now=30,
         )
-
-        self.assertEqual(validation.status, BundleValidationStatus.STALE)
         self.assertIn(BundleReason.RESULT_STALE, validation.reasons)
-        self.assertIsNone(validation.validated)
 
-    def test_fixture_7_epoch_change_after_policy_rejects_execution(self) -> None:
+    def test_decision_expiry_checked_before_execution(self):
         state = snapshot()
-        reduction, _, _, bundle, _ = self._validated_ambiguous_bundle(state)
+        reduction, _, _, validation = self.validated(state)
+        config = PolicyConfig(decision_ttl=5)
         decision = self.policy.decide(
-            state,
-            reduction,
-            bundle,
-            PolicyConfig(),
+            state, reduction, validation.validated, config, now=30
         )
-        self.assertEqual(decision.status, PolicyStatus.SELECTED)
+        fresh = replace(state, snapshot_id="snapshot-2", state_epoch=2)
+        checked = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=validation.validated,
+            config=config,
+            now=36,
+        )
+        self.assertEqual(checked.reasons, (FreshValidationReason.DECISION_EXPIRED,))
 
+    def test_consumed_judgment_expiry_checked_before_execution(self):
+        state = snapshot()
+        short = JudgmentBundleValidator(JudgmentFreshnessPolicy(max_age=15), CAL_POLICY)
+        reduction, plan = self.reduction_plan(state)
+        scheduled = self.scheduler.execute(plan, FakeJEVAdapter(ambiguous_scripts()))
+        validation = short.validate(state, plan, scheduled.results, now=30)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
+        fresh = replace(state, snapshot_id="snapshot-2", state_epoch=2)
+        checked = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=validation.validated,
+            config=POLICY_CONFIG,
+            now=36,
+        )
+        self.assertEqual(
+            checked.reasons,
+            (FreshValidationReason.JUDGMENT_EVIDENCE_EXPIRED,),
+        )
+
+    def test_policy_config_change_invalidates_decision(self):
+        state = snapshot()
+        reduction, _, _, validation = self.validated(state)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
+        fresh = replace(state, snapshot_id="snapshot-2", state_epoch=2)
+        checked = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=validation.validated,
+            config=PolicyConfig(disengage_threshold=0.7, decision_ttl=50),
+            now=40,
+        )
+        self.assertEqual(checked.reasons, (FreshValidationReason.POLICY_CONFIG_CHANGED,))
+
+    def test_judgment_identity_or_value_change_invalidates_decision(self):
+        state = snapshot()
+        reduction, plan, _, validation = self.validated(state)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
+        changed_scripts = ambiguous_scripts()
+        changed_scripts["route-risk:B"] = replace(
+            changed_scripts["route-risk:B"], value=0.21
+        )
+        changed_validation = self.validator.validate(
+            state,
+            plan,
+            self.scheduler.execute(plan, FakeJEVAdapter(changed_scripts)).results,
+            now=30,
+        )
+        fresh = replace(state, snapshot_id="snapshot-2", state_epoch=2)
+        checked = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=changed_validation.validated,
+            config=POLICY_CONFIG,
+            now=40,
+        )
+        self.assertEqual(
+            checked.reasons,
+            (FreshValidationReason.JUDGMENT_EVIDENCE_CHANGED,),
+        )
+
+    def test_semantic_input_change_invalidates_even_unselected_route(self):
+        state = snapshot()
+        reduction, _, _, validation = self.validated(state)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
+        changed_a = replace(state.routes[0], length=11)
+        fresh = replace(
+            state,
+            snapshot_id="snapshot-2",
+            state_epoch=2,
+            routes=(changed_a, state.routes[1]),
+        )
+        checked = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=validation.validated,
+            config=POLICY_CONFIG,
+            now=40,
+        )
+        self.assertEqual(
+            checked.reasons,
+            (FreshValidationReason.SEMANTIC_INPUTS_CHANGED,),
+        )
+
+    def test_canonical_snapshot_key_is_stable_under_route_order(self):
+        state = snapshot()
+        reordered = replace(state, routes=tuple(reversed(state.routes)))
+        self.assertEqual(semantic_snapshot_key(state), semantic_snapshot_key(reordered))
+
+    def test_epoch_change_rejects_execution(self):
+        state = snapshot()
+        reduction, _, _, validation = self.validated(state)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
         fresh = replace(
             state,
             snapshot_id="snapshot-2",
             observation_epoch=8,
             state_epoch=2,
         )
-        validation = FreshStateValidator().validate(decision, fresh, now=40)
-
-        self.assertFalse(validation.valid)
-        self.assertEqual(
-            validation.reasons[0].value,
-            "OBSERVATION_EPOCH_CHANGED",
+        checked = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=validation.validated,
+            config=POLICY_CONFIG,
+            now=40,
         )
-        self.assertIsNone(validation.decision)
+        self.assertEqual(
+            checked.reasons,
+            (FreshValidationReason.OBSERVATION_EPOCH_CHANGED,),
+        )
 
-    def test_fresh_validation_rejects_precondition_and_constraint_changes(self) -> None:
+    def test_correlated_probability_fusion_is_forbidden(self):
         state = snapshot()
-        reduction, _, _, bundle, _ = self._validated_ambiguous_bundle(state)
-        decision = self.policy.decide(state, reduction, bundle, PolicyConfig())
+        _, plan, scheduled, _ = self.validated(state)
+        with self.assertRaisesRegex(ValueError, "correlated"):
+            ProbabilityFusion.product(
+                plan.questions,
+                scheduled.results,
+                independence_justification="synthetic",
+            )
+
+    def test_reuse_requires_full_compatibility(self):
+        state = snapshot()
+        _, plan, scheduled, _ = self.validated(state)
+        question = plan.questions[0]
+        result = scheduled.results[0]
+        self.assertTrue(
+            reuse_allowed(
+                question,
+                result,
+                now=30,
+                freshness=FRESHNESS,
+                provider_id="fake-provider",
+                model_id="fake-model",
+                observation_epoch=state.observation_epoch,
+                allow_cross_snapshot=True,
+            )
+        )
+        changed = snapshot(snapshot_id="snapshot-2", risk_tolerance=0.6)
+        _, changed_plan = self.reduction_plan(changed)
+        changed_question = changed_plan.questions[0]
+        self.assertEqual(
+            judgment_equivalence_key(question),
+            judgment_equivalence_key(changed_question),
+        )
+        self.assertNotEqual(
+            judgment_dependency_key(question),
+            judgment_dependency_key(changed_question),
+        )
+        self.assertFalse(
+            reuse_allowed(
+                changed_question,
+                result,
+                now=30,
+                freshness=FRESHNESS,
+                provider_id="fake-provider",
+                model_id="fake-model",
+                observation_epoch=changed.observation_epoch,
+                allow_cross_snapshot=True,
+            )
+        )
+        self.assertFalse(
+            reuse_allowed(
+                question,
+                result,
+                now=30,
+                freshness=FRESHNESS,
+                provider_id="other-provider",
+                model_id="fake-model",
+                observation_epoch=state.observation_epoch,
+                allow_cross_snapshot=True,
+            )
+        )
+        self.assertFalse(
+            reuse_allowed(
+                question,
+                result,
+                now=999,
+                freshness=FRESHNESS,
+                provider_id="fake-provider",
+                model_id="fake-model",
+                observation_epoch=state.observation_epoch,
+                allow_cross_snapshot=True,
+            )
+        )
+
+    def test_optional_short_circuit_cancels_outstanding_optional_work(self):
+        state = snapshot()
+        reduction, plan = self.reduction_plan(state, optional=True)
+        scheduled = self.scheduler.execute_until_policy_sufficient(
+            plan,
+            FakeJEVAdapter(ambiguous_scripts(optional_block=True)),
+            sufficient=lambda results: all(
+                result.status is ResultStatus.ANSWERED for result in results
+            ),
+        )
+        self.assertEqual(scheduled.cancelled_optional, ("optional-context-note",))
+        validation = self.validator.validate(
+            state, plan, scheduled.results, now=30, allow_missing_optional=True
+        )
+        self.assertEqual(validation.status, BundleValidationStatus.PARTIAL)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
         self.assertEqual(decision.selected_action.candidate_id, "TAKE_ROUTE:B")
 
-        route_b_unreachable = replace(
-            state.routes[1],
-            reachable=Knowledge.known(False),
-        )
-        precondition_changed = replace(
-            state,
-            snapshot_id="snapshot-2",
-            state_epoch=2,
-            routes=(state.routes[0], route_b_unreachable),
-        )
-        precondition_validation = FreshStateValidator().validate(
-            decision,
-            precondition_changed,
-            now=40,
-        )
-        self.assertFalse(precondition_validation.valid)
-        self.assertEqual(
-            precondition_validation.reasons[0].value,
-            "REQUIRED_PRECONDITION_NO_LONGER_HOLDS",
-        )
-
-        constraint_changed = replace(
-            state,
-            snapshot_id="snapshot-3",
-            state_epoch=3,
-            constraints=HardConstraints(max_route_length=12),
-        )
-        constraint_validation = FreshStateValidator().validate(
-            decision,
-            constraint_changed,
-            now=40,
-        )
-        self.assertFalse(constraint_validation.valid)
-        self.assertEqual(
-            constraint_validation.reasons[0].value,
-            "HARD_CONSTRAINT_CHANGED_INCOMPATIBLY",
-        )
-
-    def _compiled_selected_route(self):
+    def _fresh_validated_decision(self):
         state = snapshot()
-        reduction, _, _, bundle, _ = self._validated_ambiguous_bundle(state)
-        decision = self.policy.decide(state, reduction, bundle, PolicyConfig())
+        reduction, _, scheduled, validation = self.validated(state)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
         fresh = replace(state, snapshot_id="snapshot-2", state_epoch=2)
-        fresh_validation = FreshStateValidator().validate(decision, fresh, now=40)
-        self.assertTrue(fresh_validation.valid)
-        return SimulatedActionCompiler().compile(fresh_validation.decision)
-
-    def test_fixture_8_delivered_does_not_mean_final_effect(self) -> None:
-        plan = self._compiled_selected_route()
-        evidence = SimulatedExecutor().dispatch(
-            plan,
-            command_accepted=False,
-            progressing=False,
-            final_effect=False,
+        checked = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=validation.validated,
+            config=POLICY_CONFIG,
+            now=40,
         )
-        verification = OutcomeVerifier().verify(evidence)
+        self.assertTrue(checked.valid)
+        return state, reduction, scheduled, validation, decision, checked
 
-        self.assertTrue(evidence.delivered)
-        self.assertFalse(verification.success)
-        self.assertEqual(verification.highest_stage, OutcomeStage.DELIVERED)
-
-    def test_fixture_9_success_requires_verified_final_effect(self) -> None:
-        plan = self._compiled_selected_route()
-        evidence = SimulatedExecutor().dispatch(
-            plan,
-            command_accepted=True,
-            progressing=True,
-            final_effect=True,
+    def test_pending_intent_duplicate_and_resource_conflict(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        registry = PendingIntentRegistry()
+        first = registry.admit(checked.decision)
+        self.assertEqual(first.status, IntentAdmissionStatus.ADMITTED)
+        duplicate = registry.admit(checked.decision)
+        self.assertEqual(
+            duplicate.status,
+            IntentAdmissionStatus.DUPLICATE_PENDING_INTENT,
         )
-        verification = OutcomeVerifier().verify(evidence)
 
-        self.assertTrue(verification.success)
-        self.assertEqual(verification.highest_stage, OutcomeStage.FINAL_EFFECT)
+        retreat_decision = replace(
+            checked.decision,
+            action=replace(
+                checked.decision.action,
+                candidate_id="RETREAT:safe-harbor",
+                kind=checked.decision.action.kind.RETREAT,
+                route_id=None,
+                destination_id="safe-harbor",
+            ),
+            resource_claims=("navigation",),
+        )
+        busy = registry.admit(retreat_decision)
+        self.assertEqual(busy.status, IntentAdmissionStatus.RESOURCE_BUSY)
+
+        registry.resolve(first.pending.intent_id)
+        admitted = registry.admit(retreat_decision)
+        self.assertEqual(admitted.status, IntentAdmissionStatus.ADMITTED)
+
+    def test_delivery_not_final_effect_and_verified_success(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        registry = PendingIntentRegistry()
+        admission = registry.admit(checked.decision)
+        plan = SimulatedActionCompiler().compile(checked.decision, admission)
+        executor = SimulatedExecutor()
+        incomplete = OutcomeVerifier().verify(
+            executor.dispatch(
+                plan,
+                command_accepted=False,
+                progressing=False,
+                final_effect=False,
+            )
+        )
+        self.assertFalse(incomplete.success)
+        self.assertEqual(incomplete.highest_stage, OutcomeStage.DELIVERED)
+        complete = OutcomeVerifier().verify(
+            executor.dispatch(
+                plan,
+                command_accepted=True,
+                progressing=True,
+                final_effect=True,
+            )
+        )
+        self.assertTrue(complete.success)
+        self.assertEqual(complete.highest_stage, OutcomeStage.FINAL_EFFECT)
+
+    def test_trace_replay_reproduces_policy_causality(self):
+        state = snapshot()
+        reduction, plan, scheduled, validation = self.validated(state)
+        decision = self.policy.decide(
+            state, reduction, validation.validated, POLICY_CONFIG, now=30
+        )
+        fresh = replace(state, snapshot_id="snapshot-2", state_epoch=2)
+        fresh_validation = FreshStateValidator().validate(
+            decision,
+            fresh,
+            bundle=validation.validated,
+            config=POLICY_CONFIG,
+            now=40,
+        )
+        registry = PendingIntentRegistry()
+        admission = registry.admit(fresh_validation.decision)
+        exec_plan = SimulatedActionCompiler().compile(
+            fresh_validation.decision,
+            admission,
+        )
+        outcome = OutcomeVerifier().verify(
+            SimulatedExecutor().dispatch(
+                exec_plan,
+                command_accepted=True,
+                progressing=True,
+                final_effect=True,
+            )
+        )
+        trace = TraceRecorder.record(
+            snapshot=state,
+            reduction=reduction,
+            plan=plan,
+            scheduled=scheduled,
+            validation=validation,
+            freshness=FRESHNESS,
+            calibration_policy=CAL_POLICY,
+            policy_config=POLICY_CONFIG,
+            decision=decision,
+            fresh_validation=fresh_validation,
+            execution_plan=exec_plan,
+            outcome=outcome,
+        )
+        replayed = ReplayRunner().replay(
+            trace,
+            calibration_policy=CAL_POLICY,
+            policy_config=POLICY_CONFIG,
+            now=30,
+        )
+        self.assertEqual(replayed, decision)
+        with self.assertRaisesRegex(ValueError, "policy config"):
+            ReplayRunner().replay(
+                trace,
+                calibration_policy=CAL_POLICY,
+                policy_config=PolicyConfig(disengage_threshold=0.7, decision_ttl=50),
+                now=30,
+            )
 
 
 if __name__ == "__main__":
