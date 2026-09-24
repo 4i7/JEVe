@@ -1,183 +1,209 @@
-# Architecture hardening draft
+# Architecture hardening status
 
-This note is a deliberately small follow-up to `ARCHITECTURE_VALIDATION.md`.
-It does not redefine the main architecture. It records the next contracts that
-should be proven before adding real JEV/EVE integrations.
+This note records the authority and lifecycle contracts that were promoted from the temporary hardening wrapper into the owning JEVe core validation slice.
 
-## 1. Bind policy decisions to all semantic inputs
+The temporary `src/jeve/validation_guards.py` layer has been deleted. There is now one policy/evidence authority path in `model.py` and `pipeline.py`.
 
-Problem:
+## 1. Policy decision binding
 
-A selected `PolicyDecision` is currently bound to snapshot/epoch identity, but
-that does not by itself prove that every semantic input the policy consumed is
-still equivalent before execution.
+A selected `PolicyDecision` now records:
 
-Draft response:
+```text
+semantic_input_key
+policy_config_key
+created_at
+expires_at
+judgment_bindings[]
+```
 
-- record a conservative semantic fingerprint when policy evaluates;
-- include normalized objective, hard constraints, routes and other semantic
-  state consumed by the policy;
-- reject the old decision if the fresh normalized semantic fingerprint changes;
-- do not mutate the old decision into a replacement action.
+`semantic_input_key` is a canonical JSON-derived SHA-256 fingerprint of normalized semantic policy inputs rather than a hash of Python `repr(...)` output.
 
-The draft intentionally fingerprints more state than strictly necessary. A
-future dependency model may safely become finer-grained only after replay tests
-prove that omitted fields cannot affect the decision.
+Each consumed judgment binding records:
 
-## 2. Treat validated evidence as a capability
+```text
+question_id
+result_id
+value kind
+value
+equivalence_key
+provider_id
+model_id
+schema_version
+dependency_key
+valid_until
+```
 
-Problem:
+Fresh-state validation rejects the old decision when the normalized semantic inputs, policy configuration, consumed judgment identity/value, or bound evidence lifetime no longer match.
 
-`ValidatedJudgmentBundle(bundle)` is structurally distinguishable from a raw
-bundle, but ordinary Python construction can still accidentally create it.
+The current implementation intentionally remains conservative: the semantic snapshot key covers more normalized state than a future fine-grained dependency model may require.
 
-Draft response:
+## 2. Decision freshness
 
-`PolicyUsableJudgmentBundle` requires an authority-owned seal and is issued only
-by `EvidenceAuthority` after all guards pass.
+`PolicyConfig.decision_ttl` defines an explicit decision lifetime.
 
-This is not intended as a security boundary against hostile Python code.
-Python reflection/private-name access can bypass application-level conventions.
-The goal is to make accidental construction invalid and to make the authority
-boundary explicit in normal code.
+The policy records `created_at` and `expires_at`; fresh-state validation rejects a selected decision with `DECISION_EXPIRED` before compilation.
 
-## 3. Calibration needs evidence, not only an enum
+This is separate from snapshot freshness and judgment-evidence freshness.
 
-Problem:
+## 3. Judgment evidence freshness through execution admission
 
-`CALIBRATED` currently states a conclusion without recording why that conclusion
-is justified.
+The `JudgmentBundleValidator` owns semantic evidence lifetime through `JudgmentFreshnessPolicy.max_age`.
 
-Draft response:
+Provider-supplied `fresh_until` is not treated as policy authority.
 
-A calibrated result entering policy must also carry `CalibrationEvidence`:
+The policy records the valid-until time of each judgment it actually consumed. Fresh-state validation checks those bindings again before execution admission and rejects expired evidence with `JUDGMENT_EVIDENCE_EXPIRED`.
+
+## 4. Single evidence authority path
+
+`ValidatedJudgmentBundle` has been removed from the validation slice.
+
+Policy consumes only `PolicyUsableJudgmentBundle`, which is issued by `JudgmentBundleValidator` after type/range, required-result, freshness, correlation metadata, equivalence, and calibration checks pass.
+
+The constructor uses an authority-owned seal to prevent accidental ordinary construction. This remains an application-level Python invariant, not a security boundary against hostile reflection.
+
+## 5. Calibration provenance
+
+A calibrated result now carries `CalibrationProvenance`:
 
 ```text
 authority
 basis
+provider_id
+model_id
+schema_version
+evaluation_population
+metric_name
+metric_value
 ```
 
-The draft does not prescribe a universal calibration method. Real providers may
-later normalize a documented provider guarantee, measured calibration study, or
-operator-approved calibration profile into this contract.
+A `CalibrationPolicy` declares the accepted authority set, evaluation population, metric name, and maximum accepted metric value for the current deployment/test policy.
 
-Until such evidence exists, a `CALIBRATED` enum alone is insufficient.
+The validator checks that provenance matches the result provider/model/schema and the configured calibration policy.
 
-## 4. Freshness authority
+This proves provenance integrity and policy acceptance. It does not claim that one universal calibration metric or threshold is correct for every deployment.
 
-Problem:
+## 6. Provider failure vs stale semantic evidence
 
-A provider result currently contains `fresh_until`, which can blur the boundary
-between provider metadata and policy usability.
+`ERROR` remains `PROVIDER_FAILURE` and required-evidence absence.
 
-Draft response:
+Only an answered semantic result can become `RESULT_STALE`.
 
-- provider/result reports `completed_at`;
-- `EvidenceAuthority` owns the allowed semantic evidence age;
-- provider-supplied `fresh_until` is ignored by the hardening draft;
-- snapshot freshness remains a separate normalized-state concern;
-- execution freshness remains owned by the fresh-state validator.
+The two failure classes are tested separately.
 
-This creates three explicit responsibilities:
+## 7. Correlation and statistical fusion
+
+Scheduling dependency and statistical correlation are separate contracts.
+
+The route-risk and disengagement judgments share `current-route-risk-context` while remaining executable concurrently.
+
+`ProbabilityFusion.product(...)` rejects multiplication when correlation keys repeat, even when the caller supplies an independence justification. It also requires an explicit non-empty justification before any independent-probability multiplication is allowed.
+
+The current deterministic policy does not statistically fuse the route-risk/disengagement probabilities.
+
+## 8. Judgment equivalence and reuse
+
+Reuse now requires all of the following:
 
 ```text
-provider: when the result completed
-bundle/evidence authority: whether semantic evidence is still policy-usable
-fresh-state validator: whether the selected action is still executable now
+explicit cross-snapshot reuse opt-in
+ANSWERED semantic result
+freshness still valid under validator policy
+compatible observation epoch
+provider_id match
+model_id match
+schema_version match
+judgment equivalence_key match
+semantic dependency_key match
 ```
 
-## 5. Provider failure is not stale semantic evidence
+`equivalence_key` describes judgment semantics/contract. `dependency_key` separately captures current feature values and declared freshness dependencies.
 
-A provider `ERROR` means no semantic answer was produced.
-It therefore remains provider/evidence failure and required-evidence absence.
+Cross-snapshot reuse remains disabled by default.
 
-`RESULT_STALE` applies only to an answered semantic value whose authority-owned
-freshness budget expired.
+## 9. Actual concurrency and optional cancellation
 
-The draft adds an explicit `PROVIDER_FAILURE` guard reason so diagnostics do not
-collapse these two lifecycle states.
+`JudgmentScheduler.execute(...)` runs each dependency wave with a bounded `ThreadPoolExecutor` and restores deterministic result ordering afterward.
 
-## 6. Correlation is separate from scheduling independence
-
-Questions may be executable concurrently while sharing evidence/context and
-therefore being statistically correlated.
-
-For the route-risk slice:
+`execute_until_policy_sufficient(...)` demonstrates the optional-evidence lifecycle:
 
 ```text
-ROUTE_RISK(route_a)
-ROUTE_RISK(route_b)
-SHOULD_DISENGAGE(current_context)
+start required + optional read-only work
+-> wait for required evidence
+-> policy-sufficiency predicate becomes true
+-> signal optional cancellation
+-> validate partial bundle with missing optional evidence allowed
+-> deterministic policy proceeds
 ```
 
-share `current-route-risk-context` as a correlation key.
+The fake adapter supports cooperative cancellation for this synthetic proof.
 
-The correlation key does not serialize execution. It exists to prevent future
-policy/statistical code from assuming that same-wave execution implies
-independent probabilities.
+## 10. Pending intent and semantic resource ownership
 
-No multiplication or probabilistic fusion of these values is introduced by the
-draft.
+`PendingIntentRegistry` provides the first state-changing admission boundary.
 
-## 7. `equivalence_key` and judgment reuse
+The current semantic navigation actions claim the `navigation` resource.
 
-Reuse must not be keyed only by `question_id`, prompt text, time proximity, or
-snapshot identity.
-
-The draft derives a conservative equivalence key from:
+Admission rejects:
 
 ```text
-judgment_type
-subject_id
-feature_slice
-output value kind
-output semantics
-numeric range
-calibration requirement
-abstention contract
+same unresolved semantic action -> DUPLICATE_PENDING_INTENT
+different action claiming an occupied resource -> RESOURCE_BUSY
 ```
 
-Cross-snapshot reuse remains disabled by default even when the key matches.
-The key is a prerequisite for future reuse, not permission by itself.
+Compilation requires an admitted pending intent matching the validated semantic action.
 
-A future reuse implementation must additionally prove freshness/dependency
-compatibility and provider/model/schema compatibility where those affect
-semantics.
+The resource is released explicitly when the pending intent is resolved.
 
-## 8. Parallel means actual concurrent execution
+## 11. Trace and replay
 
-The first slice represented dependency waves correctly but executed each member
-serially.
-
-`ConcurrentJudgmentScheduler` now executes members of one dependency wave via a
-bounded `ThreadPoolExecutor` and restores deterministic result order afterward.
-
-This is still only a synthetic runtime proof. It does not establish real-provider
-latency, cancellation, rate-limit behavior, or batching semantics.
-
-## 9. Next increments
-
-Keep the next work in this order:
+`DecisionTrace` captures the synthetic causal path:
 
 ```text
-1. trace/replay ownership
-2. optional-evidence policy short-circuit + cancellation
-3. pending-intent / semantic-resource ownership
+snapshot
+reduction
+judgment plan
+judgment results
+bundle validation status
+judgment freshness policy
+calibration policy identity
+policy config identity
+policy decision
+fresh validation
+execution plan
+outcome
 ```
 
-Only after these lifecycle boundaries have executable evidence should the
-project prioritize a real JEV adapter.
+`ReplayRunner` revalidates the recorded judgment evidence and reruns deterministic policy. Replay rejects configuration or calibration-policy drift and requires the reproduced `PolicyDecision` to equal the recorded decision.
 
-The reason for this ordering is that real integration would otherwise make
-replay, evidence lifetime, cancellation, and duplicate state-changing intent
-harder to separate from provider/client bugs.
+This is an in-memory replay proof, not yet a persistence format.
 
-## Draft status
+## 12. Remaining unproven provider/runtime behavior
 
-The implementation in `src/jeve/validation_guards.py` is intentionally a draft
-layer around the first validation slice rather than a large rewrite of
-`model.py` / `pipeline.py`.
+The validation slice still does not prove real-provider behavior for:
 
-If its tests remain useful after review, the next change should fold the proven
-contracts into the owning core types and delete the wrapper layer rather than
-maintaining two permanent policy/evidence paths.
+- network/transport timeout semantics;
+- cancellation after a request has reached the provider;
+- rate-limit admission/backoff;
+- provider-native batching or multi-output requests;
+- partial streaming completion;
+- real provider/model version discovery;
+- real calibration study ingestion;
+- wall-clock performance under production concurrency.
+
+These belong behind a future real JEV adapter. Core authority should not be weakened to accommodate provider limitations.
+
+## Current next direction
+
+The previously proposed sequence:
+
+```text
+trace/replay
+-> optional short-circuit/cancellation
+-> pending intent/resource ownership
+```
+
+is now represented in the synthetic core slice.
+
+The next useful increment is therefore a small adapter qualification boundary for a real JEV provider: normalize provider/model/schema identity, timeout/cancellation outcomes, rate-limit behavior, batching semantics, and partial completion into the already-proven core contracts.
+
+Real EVE observation or physical execution integration should still wait until that provider boundary can be qualified without changing deterministic policy semantics.
