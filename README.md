@@ -2,20 +2,26 @@
 
 JEVe is a reference architecture for low-latency decision systems in EVE Online.
 
-The central idea is simple: **do not ask an AI model to decide what deterministic code can already decide**. Reduce the world state mechanically first, invoke JEV only for the remaining semantic ambiguity, then re-enter a deterministic path for validation and execution.
+The central idea is:
 
-JEVe is intentionally an architecture-and-contract repository rather than a finished automation implementation. It is meant to provide enough structure that a human or an AI coding agent can build an MVP without having to rediscover the core boundaries.
+> **Use deterministic code for facts, constraints, state machines, and final action policy; use JEV for the semantic uncertainty that deterministic code cannot resolve cheaply.**
+
+JEVe is intentionally an architecture-and-contract repository rather than a finished automation implementation. The documents are meant to be detailed enough that a human or an AI coding agent can expand the design into an MVP without first rediscovering the major boundaries.
 
 ## Core idea
 
-Treat decision making as a pipeline:
+The primary JEVe fast path is not "ask a model what action to take".
+
+Instead, decompose the unresolved semantics into small typed judgments, evaluate independent judgments in parallel, then let ordinary deterministic code combine those judgments with known state and constraints.
 
 ```text
 World state
   -> deterministic normalization
-  -> candidate generation
-  -> deterministic reduction
-  -> JEV only when ambiguity remains
+  -> exact facts / constraints / candidate space
+  -> unresolved semantic dimensions
+  -> decomposed JEV judgments, preferably in parallel
+  -> validated probabilistic semantic evidence
+  -> deterministic action policy
   -> fresh-state validation
   -> semantic-action compilation
   -> execution
@@ -23,26 +29,72 @@ World state
   -> new world state
 ```
 
-For state `S_t` and possible actions `A(S_t)`:
+A typical JEV interaction therefore looks more like:
 
 ```text
-A0 = A(S_t)
-A1 = rule_filter(A0)
-A2 = deterministic_reduce(A1)
-
-if |A2| == 0: fail closed / request more observation
-if |A2| == 1: select A2[0] without JEV
-if |A2| > 1:  ask JEV to select only from A2
+structured state
+      |
+      +--> hostile_probability --------+
+      +--> route_a_risk ---------------+
+      +--> route_b_risk ---------------+--> JudgmentBundle
+      +--> disengage_probability ------+
+      +--> target_preference ----------+
+                                          |
+                                          v
+                               DeterministicPolicy
+                                          |
+                                          v
+                                       RETREAT
 ```
 
-The important boundary is:
+rather than:
 
 ```text
-JEV may choose among valid semantic actions.
-JEV does not gain authority to invent or directly execute physical actions.
+candidate A / B / C
+        |
+        v
+       JEV
+        |
+        v
+selected_candidate = B
 ```
 
-This keeps the probabilistic part small, bounded, replaceable, observable, and fast.
+Closed-candidate selection is still supported as a bounded compatibility mode when decomposition would add no value, but it is no longer the conceptual center of JEVe.
+
+## Authority boundary
+
+The strongest invariant is:
+
+```text
+probabilistic judgment != action authority
+```
+
+JEV may produce semantic evidence such as:
+
+```text
+hostile_probability = 0.84
+route_a_risk = 0.73
+route_b_risk = 0.31
+disengage_probability = 0.78
+target_preference = target_3
+```
+
+but a deterministic policy owns the actual branch:
+
+```text
+DeterministicPolicy(
+    fresh_state,
+    hard_constraints,
+    valid_candidates,
+    judgment_bundle
+) -> SemanticAction
+```
+
+This makes the existing JEVe rule stronger:
+
+> **No probabilistic judgment creates physical authority.**
+
+The probabilistic layer contributes evidence. Deterministic code decides whether that evidence is sufficient, comparable, fresh, policy-compliant, and safe enough to justify a semantic action.
 
 ## Architecture
 
@@ -50,17 +102,28 @@ This keeps the probabilistic part small, bounded, replaceable, observable, and f
 flowchart TD
     W[EVE world] --> O[State observer]
     O --> N[Normalizer / immutable snapshot]
-    N --> C[Candidate generator]
+    N --> C[Candidate generator + exact mechanical facts]
     C --> R[Deterministic reducer]
 
-    R -->|0 candidates| U[Unknown / insufficient evidence]
-    R -->|1 candidate| V[Fresh-state validation]
-    R -->|2+ candidates| D[Decision router]
+    R -->|fully decidable| P[Deterministic policy]
+    R -->|semantic uncertainty remains| JP[Judgment planner]
 
-    D -->|bounded semantic choice| J[JEV adapter]
-    D -->|high stakes / low confidence / novelty| L[Deliberative escalation]
-    J --> V
-    L --> V
+    JP --> Q1[JEV judgment A]
+    JP --> Q2[JEV judgment B]
+    JP --> Q3[JEV judgment C]
+    JP --> QN[JEV judgment ...]
+
+    Q1 --> JB[Judgment bundle validator]
+    Q2 --> JB
+    Q3 --> JB
+    QN --> JB
+
+    JB --> P
+    P -->|insufficient / novel / high stakes| D[Deliberative escalation]
+    D --> P
+
+    P -->|semantic action| V[Fresh-state validation]
+    P -->|observe more / fail closed| O
 
     V -->|invalid or stale| O
     V -->|valid| A[Semantic action compiler]
@@ -69,45 +132,69 @@ flowchart TD
     Q --> O
 ```
 
-The architecture is a **deterministic -> semantic -> deterministic sandwich**:
+The architecture remains a **deterministic -> probabilistic evidence -> deterministic** sandwich:
 
-1. **Before JEV:** normalize observations, reject impossible actions, calculate known quantities, remove dominated choices, and decide mechanically whenever possible.
-2. **At JEV:** present a compact structured decision with a closed candidate set. JEV performs semantic selection, not UI manipulation.
-3. **After JEV:** reject stale decisions, re-check preconditions, compile the semantic action into an implementation-specific execution plan, and verify the result from observation.
+1. **Before JEV:** normalize observations, calculate exact values, enforce hard constraints, remove impossible actions, and identify only the semantic questions that remain unresolved.
+2. **At JEV:** evaluate small typed judgment questions. Independent questions should be evaluated concurrently when the provider/runtime permits it.
+3. **After JEV:** validate the returned judgment bundle, combine it with known state through deterministic policy, reject stale or insufficient evidence, and only then produce a semantic action.
+4. **Before physical execution:** revalidate the chosen semantic action against fresh state and compile it into an implementation-specific execution plan.
 
 ## Why this can be fast
 
-The latency-sensitive path is kept deliberately narrow.
+The fastest model call is the one that is unnecessary. The second-fastest path is a small set of independent judgments that can run concurrently.
 
-- Do not send raw UI state to JEV when normalized features are enough.
-- Do not ask JEV to enumerate actions when code can enumerate them.
-- Do not invoke JEV when deterministic reduction leaves one answer.
-- Keep the candidate set small and typed.
-- Reuse derived state within the same observation epoch.
-- Route uncertain or high-consequence decisions to a slower deliberative path rather than making every decision slow.
-- Keep physical actuation out of the model call, so reasoning latency and input timing are independent.
+JEVe therefore optimizes in this order:
 
-A useful routing function is conceptually:
+- resolve exact questions mechanically;
+- eliminate impossible or dominated actions mechanically;
+- identify only unresolved semantic dimensions;
+- project only the features needed by each judgment;
+- evaluate independent judgments in parallel;
+- allow deterministic policy to proceed as soon as its required evidence set is complete;
+- cancel optional or stale work when a newer snapshot supersedes it;
+- keep physical actuation outside model execution so cognition can run faster than mutation.
+
+For example, instead of sending a large state blob and asking for one answer, JEVe may issue four small independent questions:
 
 ```text
-route = f(
-  candidate_count,
-  confidence,
-  top_two_margin,
-  stakes,
-  novelty,
-  state_freshness,
-  latency_budget
-)
+Q1: probability current contact is hostile
+Q2: semantic risk of route A
+Q3: semantic risk of route B
+Q4: probability current situation warrants disengagement
 ```
 
-This is a routing policy, not a rule that JEV should decide for itself.
+If they are independent, wall-clock cost approaches the slowest required judgment rather than the sum of all four latencies.
+
+## Judgment values are typed evidence
+
+A numeric model output is not automatically a calibrated probability.
+
+JEVe therefore requires judgment output semantics to be explicit, for example:
+
+```text
+PROBABILITY
+SCORE
+BOOLEAN
+ENUM
+RANKING
+DISTRIBUTION
+```
+
+and, where relevant, calibration metadata should distinguish:
+
+```text
+CALIBRATED
+UNCALIBRATED
+UNKNOWN
+```
+
+Deterministic policy must not silently compare values with incompatible meaning. A `0.8` uncalibrated preference score and a `0.8` calibrated probability are not interchangeable.
 
 ## State is not just true or false
 
-EVE is partially observable and changes while a decision is being computed. JEVe therefore treats uncertainty and staleness as first-class state.
+EVE is partially observable and changes while cognition is running. JEVe treats uncertainty and staleness as first-class state.
 
-A field may be:
+A fact may be:
 
 ```text
 KNOWN_TRUE
@@ -117,11 +204,13 @@ STALE
 TRANSITIONAL
 ```
 
-`UNKNOWN` must never silently become `false`. A decision also belongs to the observation epoch that produced its evidence. If the relevant epoch changes before execution, the decision must be revalidated or discarded.
+`UNKNOWN` must never silently become `false`.
+
+Judgments are also bound to the snapshot and observation epoch that produced their input. If the relevant world changes before deterministic policy or execution can safely consume them, the bundle is revalidated, partially recomputed, or discarded.
 
 ## Semantic actions vs physical actions
 
-JEV should work with domain-level actions such as:
+The deterministic action policy emits domain-level actions such as:
 
 ```text
 WAIT
@@ -133,13 +222,13 @@ ENGAGE_TARGET(target_id)
 INVESTIGATE(object_id)
 ```
 
-It should not return mouse coordinates, key presses, window handles, or UI traversal steps.
+Neither JEV judgments nor semantic policy output contain mouse coordinates, key presses, window handles, or stale UI references.
 
-The semantic action is later compiled by an implementation-specific adapter:
+The semantic action is later compiled through a separate boundary:
 
 ```text
 SemanticAction
-  -> verify preconditions
+  -> verify fresh preconditions
   -> resolve current target/control
   -> produce an execution plan
   -> issue bounded input
@@ -148,46 +237,82 @@ SemanticAction
   -> verify final effect
 ```
 
-This separation lets the decision architecture survive changes to client layout, input transport, localization, or platform details.
+## Decision layers
 
-## Decision tiers
+JEVe separates four different jobs that are easy to conflate:
 
-JEVe assumes three decision tiers.
-
-| Tier | Purpose | Typical examples |
+| Layer | Purpose | Examples |
 |---|---|---|
-| Deterministic | Things code can prove or calculate | legality, reachability, distance, capacity, timers, exact constraints, dominance elimination |
-| JEV fast path | Small bounded semantic ambiguity | wait vs continue, threat interpretation, route preference under uncertain risk, target preference |
-| Deliberative path | Novel, long-horizon, high-stakes, or poorly specified problems | generating a new plan, resolving conflicting objectives, requesting new observations |
+| Mechanical state | Things code can prove or calculate | legality, reachability, distance, capacity, timers, exact state-machine constraints |
+| JEV judgment | Semantic evidence that is expensive or awkward to encode exactly | threat probability, contextual risk, preference, disengagement likelihood |
+| Deterministic policy | Combines exact state + constraints + judgments into an action | thresholding, weighted policy, rule table, state machine, utility branch |
+| Deliberative path | Novel, long-horizon, underspecified, or high-stakes reasoning | new plan generation, conflicting objectives, deciding what new evidence is required |
 
-As the system matures, repeated stable decisions can move downward from JEV into deterministic rules. The desired long-term direction is therefore not "use more AI", but **compile stable judgment into cheaper deterministic behavior whenever the invariant is understood**.
+This separation matters because a JEV result can be useful even when it does not directly name an action.
+
+## Closed-candidate selector mode
+
+JEVe still permits a bounded selector mode:
+
+```text
+CandidatePreferenceRequest(A, B, C)
+  -> preference / ranking / selected candidate
+```
+
+Use it when the semantic question really is irreducibly "which of these alternatives is preferable?" and decomposition would only recreate the same choice indirectly.
+
+Even in selector mode, the result is treated as probabilistic evidence. Deterministic policy still owns:
+
+- whether the result is acceptable;
+- whether confidence/margin semantics are meaningful;
+- whether the state is still fresh;
+- whether a higher-priority constraint inhibits the action;
+- whether to execute, deliberate, observe more, wait, or fail closed.
+
+## Maturation direction
+
+As a domain becomes better understood, repeated model judgments should not automatically become hard-coded rules.
+
+The desired progression is:
+
+```text
+repeated judgment pattern
+  -> evidence collection
+  -> hypothesized invariant
+  -> deterministic rule
+  -> adversarial replay validation
+  -> optional promotion into mechanical policy
+```
+
+The long-term goal is not "use more AI". It is to move stable, understood reasoning into cheaper deterministic machinery while leaving genuinely semantic uncertainty in the probabilistic layer.
 
 ## MVP scope
 
-The MVP described here does not need a full EVE automation stack. It needs only enough implementation to prove the architecture:
+The architecture MVP needs only enough implementation to prove the boundary:
 
 1. immutable normalized state snapshots;
-2. candidate generation and deterministic reduction;
-3. a decision router;
-4. a replaceable JEV adapter;
-5. a typed `DecisionRequest` / `DecisionResponse` contract;
-6. fresh-state decision validation;
-7. semantic action compilation as an interface;
-8. an executor boundary that can initially be a simulator or stub;
-9. outcome verification and replayable decision traces;
-10. synthetic scenarios covering deterministic, JEV, escalation, stale-state, and fail-closed paths.
+2. deterministic candidate generation and reduction;
+3. a typed `JudgmentPlan` containing independent semantic questions;
+4. a replaceable JEV judgment adapter with parallel-capable execution semantics;
+5. typed `JudgmentResult` and `JudgmentBundle` contracts;
+6. deterministic policy that consumes state + constraints + judgments and emits a semantic action or a non-action route;
+7. fresh-state validation;
+8. semantic action compilation as an interface;
+9. a simulated executor and outcome verifier;
+10. replayable traces covering deterministic-only, judgment-driven, partial-bundle, stale-bundle, escalation, and fail-closed paths.
 
-No particular JEV transport, UI automation mechanism, programming language, or EVE client integration is required by the architecture.
+No particular JEV transport, EVE observation mechanism, programming language, or physical input mechanism is required by the architecture.
 
 ## Documents
 
 Read in this order when implementing or extending JEVe:
 
 1. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — normative component boundaries and invariants.
-2. [`docs/DETAILED_DESIGN.md`](docs/DETAILED_DESIGN.md) — data contracts, decision routing, lifecycle, failure handling, and suggested module structure.
-3. [`docs/MVP_PLAN.md`](docs/MVP_PLAN.md) — smallest useful implementation and acceptance criteria.
-4. [`docs/CLEAN_ROOM.md`](docs/CLEAN_ROOM.md) — how to reimplement integrations without importing source-specific assumptions from other repositories.
-5. [`AGENTS.md`](AGENTS.md) — concise instructions for AI coding agents working in this repository.
+2. [`docs/JEV_JUDGMENT_MODEL.md`](docs/JEV_JUDGMENT_MODEL.md) — decomposition, parallel judgment, bundle semantics, and policy composition.
+3. [`docs/DETAILED_DESIGN.md`](docs/DETAILED_DESIGN.md) — implementation-ready contracts, routing, lifecycle, failure handling, and suggested module structure.
+4. [`docs/MVP_PLAN.md`](docs/MVP_PLAN.md) — smallest useful implementation and acceptance criteria.
+5. [`docs/CLEAN_ROOM.md`](docs/CLEAN_ROOM.md) — independent implementation boundaries.
+6. [`AGENTS.md`](AGENTS.md) — concise instructions for AI coding agents.
 
 ## Non-goals
 
@@ -196,12 +321,11 @@ JEVe does not prescribe:
 - a specific EVE input mechanism;
 - a specific UI parser or telemetry source;
 - a specific JEV implementation or provider;
+- treating uncalibrated scores as objective probabilities;
 - a monolithic autonomous agent;
 - hidden fallback from semantic uncertainty to blind physical input;
 - copying implementation details from an unrelated repository.
 
-The repository defines boundaries and invariants so those pieces can be implemented independently.
-
 ## Design principle in one sentence
 
-> **Mechanically decide everything that can be mechanically decided; use JEV only for bounded semantic ambiguity; then return to deterministic validation and verified execution.**
+> **Mechanically establish what can be known exactly, ask JEV only for the unresolved semantic evidence, combine that evidence with deterministic policy, then revalidate and execute through a separate verified control path.**

@@ -8,13 +8,15 @@ The intended reader is a human or AI coding agent preparing an MVP.
 
 The implementation should make the following properties obvious in code structure:
 
-- deterministic logic is separate from probabilistic reasoning;
-- JEV is a replaceable decision provider, not an executor;
-- semantic actions are separate from physical operations;
-- stale decisions are rejected rather than patched with guesses;
-- uncertainty is explicit in state;
+- deterministic facts and rules are separate from probabilistic semantic judgments;
+- JEV is primarily a semantic evidence provider, not an executor or final authority;
+- independent semantic judgments can run concurrently;
+- deterministic policy combines exact state, constraints, candidate space, and validated judgments;
+- semantic actions remain separate from physical operations;
+- stale judgments and stale decisions are rejected rather than patched with guesses;
+- uncertainty is explicit in state and in judgment output semantics;
 - action outcome is verified from observation;
-- every decision can be replayed offline;
+- every policy branch can be replayed offline;
 - provider/client-specific integration details are isolated behind adapters.
 
 ## 2. Suggested module boundaries
@@ -26,8 +28,11 @@ core/
   state/
   candidates/
   reduction/
-  routing/
-  decisions/
+  judgments/
+    planning/
+    contracts/
+    validation/
+  policy/
   validation/
   actions/
   verification/
@@ -41,6 +46,7 @@ adapters/
 
 runtime/
   decision-loop/
+  judgment-scheduler/
   pending-intents/
   clocks/
 
@@ -97,8 +103,6 @@ A snapshot is immutable after publication.
 
 ### 3.3 Objective
 
-An objective should be a declarative goal, not a command sequence.
-
 ```text
 Objective = {
   id: string,
@@ -119,6 +123,8 @@ MAINTAIN_DISTANCE(target_id, range_band)
 LEAVE_DANGEROUS_STATE
 ```
 
+An objective describes a desired state, not a physical command sequence.
+
 ### 3.4 Constraint
 
 ```text
@@ -130,7 +136,7 @@ Constraint = {
 }
 ```
 
-Hard constraints may remove candidates. Soft constraints influence scoring/routing but must not masquerade as hard safety rules.
+Hard constraints may eliminate actions. Soft constraints may influence policy but must not masquerade as hard safety rules.
 
 ### 3.5 Semantic action
 
@@ -146,8 +152,6 @@ SemanticAction = {
 }
 ```
 
-`candidate_id` is unique within a decision request.
-
 Physical references such as screen coordinates must not appear here.
 
 ### 3.6 Candidate set
@@ -161,7 +165,7 @@ CandidateSet = {
 }
 ```
 
-Candidate generation should be complete with respect to the currently supported action vocabulary. If the generator cannot establish completeness, surface that fact explicitly.
+Candidate generation should be complete with respect to the currently supported action vocabulary. If completeness cannot be established, surface that fact explicitly.
 
 ### 3.7 Reduction result
 
@@ -182,46 +186,120 @@ ReductionResult = {
 
 Every eliminated candidate needs a deterministic reason.
 
-### 3.8 Decision request
+### 3.8 Judgment output contract
 
 ```text
-DecisionRequest = {
-  request_id: string,
+JudgmentOutputContract = {
+  value_kind:
+    PROBABILITY | SCORE | BOOLEAN | ENUM | RANKING | DISTRIBUTION,
+  semantics: string,
+  range?: [number, number],
+  enum_values?: string[],
+  calibration_requirement?: NONE | DECLARED | CALIBRATED,
+  abstention_allowed: boolean
+}
+```
+
+The `semantics` field defines what a value means. Encoding alone is insufficient.
+
+### 3.9 Judgment question
+
+```text
+JudgmentQuestion = {
+  question_id: string,
+  judgment_type: string,
+  subject?: SemanticReference,
+  feature_slice: map,
+  output_contract: JudgmentOutputContract,
+  criticality: REQUIRED | OPTIONAL,
+  depends_on: string[],
+  freshness_dependencies: string[],
+  deadline?: timestamp,
+  equivalence_key?: string
+}
+```
+
+A question asks for semantic evidence, not a physical operation.
+
+### 3.10 Judgment plan
+
+```text
+JudgmentPlan = {
+  plan_id: string,
   snapshot_id: string,
   observation_epoch: integer|string,
-  objective: CompactObjective,
-  candidates: CompactCandidate[],
-  features: DecisionFeatureSet,
-  stakes: LOW | MEDIUM | HIGH,
+  objective_id: string,
+  questions: JudgmentQuestion[],
+  required_question_ids: string[],
+  optional_question_ids: string[],
   deadline?: timestamp,
   schema_version: string
 }
 ```
 
-The request intentionally does not need the entire world state. It should contain only decision-relevant normalized features.
+The plan should be deterministic for the same normalized state, policy requirements, and configuration.
 
-### 3.9 Decision response
+### 3.11 Judgment result
 
 ```text
-DecisionResponse = {
-  request_id: string,
-  selected_candidate_id?: string,
-  status: SELECTED | ABSTAIN | NEED_MORE_INFORMATION | ERROR,
-  scores?: map<candidate_id, number>,
+JudgmentResult<T> = {
+  question_id: string,
+  status: ANSWERED | ABSTAIN | NEED_MORE_INFORMATION | ERROR,
+  value?: T,
   confidence?: number,
-  rationale_tags?: string[],
+  calibration: CALIBRATED | UNCALIBRATED | UNKNOWN | NOT_APPLICABLE,
   requested_features?: string[],
+  snapshot_id: string,
+  observation_epoch: integer|string,
+  completed_at: timestamp,
   adapter_metadata?: map
 }
 ```
 
-`ABSTAIN` is a valid outcome. The system should not force a selection when the model cannot distinguish candidates reliably.
+`confidence` is advisory evidence quality metadata, not action authority.
 
-### 3.10 Validated decision
+### 3.12 Judgment bundle
+
+```text
+JudgmentBundle = {
+  bundle_id: string,
+  plan_id: string,
+  snapshot_id: string,
+  observation_epoch: integer|string,
+  results: map<question_id, JudgmentResult>,
+  missing_required: string[],
+  missing_optional: string[],
+  validation_status: VALID | PARTIAL | INVALID | STALE,
+  completed_at: timestamp,
+  timings: map<string, duration>
+}
+```
+
+A partial bundle may be policy-usable only when every missing result is explicitly optional for the branch being evaluated.
+
+### 3.13 Policy decision
+
+```text
+PolicyDecision = {
+  transaction_id: string,
+  status:
+    SELECTED | OBSERVE_MORE | DELIBERATE | WAIT | FAIL_CLOSED,
+  selected_candidate_id?: string,
+  reason_codes: string[],
+  judgment_refs: string[],
+  policy_version: string,
+  evaluated_snapshot_id: string,
+  observation_epoch: integer|string
+}
+```
+
+This is the first object that states which semantic branch the system intends to take.
+
+### 3.14 Validated decision
 
 ```text
 ValidatedDecision = {
-  request_id: string,
+  transaction_id: string,
   selected_action: SemanticAction,
   validation_snapshot_id: string,
   validation_observation_epoch: integer|string,
@@ -232,7 +310,7 @@ ValidatedDecision = {
 
 This is the first object eligible for compilation into physical execution.
 
-### 3.11 Execution plan
+### 3.15 Execution plan
 
 ```text
 ExecutionPlan = {
@@ -252,7 +330,7 @@ ExecutionPlan = {
 
 Retries should default to none unless the action-specific design proves a safe retry condition.
 
-### 3.12 Decision trace
+### 3.16 Decision trace
 
 ```text
 DecisionTrace = {
@@ -260,17 +338,18 @@ DecisionTrace = {
   snapshot_ref: string,
   candidate_generation: summary,
   reduction: summary,
-  routing: summary,
-  model_request?: summary,
-  model_response?: summary,
-  validation: summary,
+  judgment_plan?: summary,
+  judgment_results?: summary,
+  bundle_validation?: summary,
+  policy: summary,
+  fresh_validation: summary,
   execution?: summary,
   outcome?: summary,
   timings: map<string, duration>
 }
 ```
 
-A replay runner should be able to consume the normalized portion without requiring the live client.
+Replay must be possible without the live client.
 
 ## 4. Processing pipeline
 
@@ -290,9 +369,9 @@ RawObservation
 
 Rules:
 
-- do not infer semantics that belong to normalization;
+- do not infer semantics that belong to normalization or judgment;
 - preserve acquisition time and source identity;
-- detect source failure separately from observed absence.
+- distinguish source failure from observed absence.
 
 ### Stage B: normalize
 
@@ -312,9 +391,9 @@ Rules:
 
 - convert source-specific values into domain facts;
 - label unknowns explicitly;
-- calculate cheap deterministic derived facts;
+- calculate cheap exact derived facts;
 - establish epoch/freshness metadata;
-- reject contradictions rather than picking one silently.
+- reject contradictions rather than silently choosing one source.
 
 ### Stage C: generate candidates
 
@@ -333,9 +412,9 @@ CandidateSet
 Rules:
 
 - generate semantic, not physical, alternatives;
-- never include an action already forbidden by static capability configuration;
+- do not generate actions forbidden by static capability configuration;
 - parameterize by semantic IDs;
-- avoid combinatorial explosion by generating only actions relevant to the active objective and current state.
+- keep the set relevant to current objectives and state.
 
 ### Stage D: deterministic reduction
 
@@ -354,129 +433,193 @@ ReductionResult
 Suggested reduction order:
 
 1. schema/parameter validity;
-2. hard capability availability;
+2. capability availability;
 3. hard preconditions;
 4. hard safety constraints;
 5. objective relevance;
 6. exact resource/timer/range constraints;
 7. pending-intent conflict;
-8. strict dominance;
+8. strict dominance under exact dimensions;
 9. operator policy filters.
 
-Order should be stable so traces remain easy to compare.
+Do not use JEV inside deterministic reduction.
 
-Do not use a model inside deterministic reduction.
+### Stage E: pre-judgment policy check
 
-### Stage E: route
+Before planning JEV work, ask whether exact state already determines the branch.
+
+Examples:
+
+```text
+0 candidates -> OBSERVE_MORE or FAIL_CLOSED
+1 candidate + all policy requirements exact -> SELECT without JEV
+hard emergency rule -> deterministic emergency action
+objective already satisfied -> no action
+```
+
+The purpose is to avoid semantic calls that cannot change the outcome.
+
+### Stage F: judgment planning
 
 Input:
 
 ```text
-StateSnapshot + ReductionResult
+StateSnapshot
+ReductionResult
+PolicyEvidenceRequirements
 ```
 
 Output:
 
 ```text
-DETERMINISTIC_SELECT | JEV_FAST | DELIBERATE | OBSERVE_MORE | FAIL_CLOSED
+JudgmentPlan
 ```
 
-Baseline policy:
+Rules:
+
+- identify only unresolved semantic dimensions that can affect policy;
+- prefer small typed questions over one monolithic action-selection request;
+- mark required vs optional questions;
+- declare dependencies explicitly;
+- assign per-question output semantics;
+- bind questions to freshness dependencies;
+- project only relevant features.
+
+Example:
 
 ```text
-0 candidates -> OBSERVE_MORE or FAIL_CLOSED
-1 candidate  -> DETERMINISTIC_SELECT
-2+ candidates:
-  stale/insufficient critical evidence -> OBSERVE_MORE
-  high novelty -> DELIBERATE
-  high stakes + weak expected confidence -> DELIBERATE
-  otherwise -> JEV_FAST
+Q1 hostile_probability(contact_17)
+Q2 route_risk(route_a)
+Q3 route_risk(route_b)
+Q4 disengage_probability(context)
 ```
 
-The exact thresholds are configuration, not architecture.
+### Stage G: schedule judgments
 
-### Stage F: compact decision context
+The scheduler constructs execution waves from `depends_on`.
 
-Before JEV invocation, project the snapshot into candidate-discriminating features.
+Questions with no unsatisfied dependency may execute concurrently.
 
-Good request data:
+Rules:
+
+- enforce plan and per-question deadlines;
+- support cancellation;
+- keep question identities stable for tracing;
+- do not serialize independent questions without a reason;
+- do not infer physical authority from concurrency.
+
+Provider-native multi-output batching and multiple parallel provider calls are both valid implementations if they preserve question/result correlation.
+
+### Stage H: JEV evaluation
+
+The adapter should:
+
+1. serialize a typed semantic question or provider-native batch;
+2. enforce deadlines/cancellation;
+3. parse output strictly;
+4. validate basic type/range constraints;
+5. preserve abstention and provider errors as data;
+6. record latency and provider metadata;
+7. never convert transport failure into a semantic value.
+
+### Stage I: bundle assembly and validation
+
+Input:
 
 ```text
-objective
-candidate IDs and semantic descriptions
-risk-related normalized features
-relevant distances/ranges/timers
-relevant known/unknown status
-recent decision context when stability matters
+JudgmentPlan + JudgmentResults
 ```
 
-Bad request data by default:
+Output:
 
 ```text
-entire UI tree
-screenshots when normalized evidence already exists
-unrelated inventory/state
-executor-specific coordinates
-large history with no decision relevance
+JudgmentBundle
 ```
 
-The compactor should be deterministic and replayable.
-
-### Stage G: JEV decision
-
-The JEV adapter should:
-
-1. serialize the typed request;
-2. enforce a deadline;
-3. parse the response strictly;
-4. reject unknown candidate IDs;
-5. return adapter errors as data, not hidden fallback;
-6. record latency and adapter metadata;
-7. support cancellation when the originating decision becomes stale.
-
-A transport error should not become an arbitrary candidate selection.
-
-### Stage H: post-decision routing
-
-If the JEV response contains scores:
+Checks include:
 
 ```text
-best = top score
-second = second-highest score
-margin = best - second
+question/result correlation
+snapshot/epoch binding
+value kind and range
+required result presence
+calibration requirement
+freshness
+contract-specific consistency
 ```
 
-A configurable policy may:
+A numeric output with the wrong semantic type is invalid even if its numeric range looks plausible.
 
-- accept high-confidence/high-margin low-stakes decisions;
-- deliberate on low-margin decisions;
-- observe more if critical features are unknown;
-- fail closed when the deadline is gone and no safe default exists.
+### Stage J: deterministic policy
 
-A default action such as `WAIT` should be explicit in the candidate set if it is intended to be selectable.
+Input:
 
-### Stage I: fresh-state validation
+```text
+StateSnapshot
+ReductionResult.surviving_candidates
+ConstraintSet
+JudgmentBundle
+PolicyConfig
+```
 
-Validation should acquire or reference a sufficiently fresh current snapshot.
+Output:
+
+```text
+PolicyDecision
+```
+
+The policy must be deterministic for identical validated inputs and configuration.
+
+Possible implementation styles:
+
+```text
+rule table
+threshold policy
+finite state machine
+deterministic utility calculation
+configured weighted scoring
+hysteresis-based branch logic
+```
+
+The policy may return a non-action route rather than forcing selection.
+
+### Stage K: deliberative escalation
+
+Escalate when, for example:
+
+```text
+required judgment schema is missing
+candidate generation is itself uncertain
+novel state exceeds fast-path policy
+critical judgments conflict under an explicit invariant
+consequence class exceeds accepted evidence quality
+objectives conflict beyond deterministic policy
+```
+
+The deliberative layer must return to deterministic policy or semantic-action validation. It cannot directly dispatch physical input.
+
+### Stage L: fresh-state validation
+
+Before compilation, validate the selected semantic action against a sufficiently fresh current snapshot.
 
 Check:
 
 ```text
-selected candidate still semantically exists
-required entities still exist
-required preconditions still hold
+selected candidate still exists
+required semantic entities still exist
+hard preconditions still hold
 relevant constraints unchanged
-observation epoch compatibility
-pending intent compatibility
-freshness budget not exceeded
+observation epoch compatible
+pending intent compatible
+freshness budget acceptable
 higher-priority inhibit absent
 ```
 
-If the action requires physical target resolution, physical references should be resolved here or later, never reused blindly from the model request.
+A policy decision made from valid judgments can still become invalid before execution.
 
-### Stage J: compile
+### Stage M: compile
 
-The compiler consumes only a validated semantic action plus a current snapshot.
+The compiler consumes only a validated semantic action plus current state.
 
 It may return:
 
@@ -487,9 +630,9 @@ UNSUPPORTED(reason)
 INHIBITED(reason)
 ```
 
-It should not silently choose another semantic action when the selected one cannot be compiled.
+It must not silently choose a different semantic action.
 
-### Stage K: dispatch and verify
+### Stage N: dispatch and verify
 
 A generic transaction shape:
 
@@ -504,88 +647,195 @@ compile
 -> final-effect check
 ```
 
-The exact number of physical steps is action-specific.
+The exact physical sequence is action-specific.
 
-## 5. Fast decision design
+## 5. Fast judgment design
 
-The performance objective is to reduce expensive semantic work before optimizing the model call itself.
+### 5.1 Judgment-first semantic decomposition
 
-### 5.1 Candidate-first reasoning
+The normal fast path should ask for semantic quantities that deterministic policy can compose.
 
-Model complexity increases rapidly when it must both invent and evaluate actions.
-
-Therefore the normal fast path provides a closed set:
+Prefer:
 
 ```text
-{A, B, C}
+threat probability
+route risk
+engagement suitability
+disengagement suitability
+target preference
 ```
 
-instead of asking:
+over:
 
 ```text
-"What should I do?"
+"What action should I take?"
 ```
 
-This improves latency, parseability, testability, and authority control.
+when the decomposition is meaningful.
 
-### 5.2 Feature locality
+Benefits include:
 
-Features should be selected based on the surviving candidate set.
+- reusable outputs;
+- smaller contexts;
+- explicit semantics;
+- parallel execution;
+- deterministic policy control;
+- easier replay and threshold tuning.
+
+### 5.2 When not to decompose
+
+Do not create decomposition merely to satisfy the architecture.
+
+A closed-candidate preference judgment is reasonable when:
+
+- the unresolved semantic property is inherently comparative;
+- the alternatives are already known and bounded;
+- separate component scores would be artificial or misleading;
+- no reusable sub-judgment is gained.
+
+Represent selector mode as a judgment result consumed by policy.
+
+### 5.3 Feature locality
+
+Feature slices should be selected per judgment type and subject.
+
+A feature dependency registry may look like:
+
+```text
+JudgmentType -> RequiredFeatureGroups
+JudgmentType + SubjectKind -> OptionalFeatureGroups
+```
+
+Avoid serializing unrelated world state into each model call.
+
+### 5.4 Parallelism
+
+Independent questions should be scheduled in the same wave.
+
+Measure:
+
+```text
+sum_of_question_latencies
+required_bundle_wall_clock_latency
+```
+
+The difference between these values reveals the benefit of parallel execution.
+
+### 5.5 Policy sufficiency and early completion
+
+The policy does not need every optional judgment if the required evidence already determines the branch.
 
 Example:
 
-If all surviving actions concern route choice, combat-fit details that cannot affect route choice should be omitted.
-
-Implementations may define a feature dependency registry:
-
 ```text
-ActionType -> RequiredFeatureGroups
-CandidatePair -> DiscriminatingFeatureGroups
+required hostile_probability complete
+required disengage_probability complete
+policy returns RETREAT
+optional target_preference still running
 ```
 
-This allows deterministic prompt/context minimization.
+The scheduler may cancel the optional question.
 
-### 5.3 Caching
+### 5.6 Caching
 
-Safe cache keys should include the observation epoch and source snapshot identity.
+Safe cache keys should describe semantic dependency equivalence, not merely time proximity.
 
 Candidates for caching:
 
 - static domain metadata;
-- route graph calculations;
-- candidate-independent normalized facts;
-- deterministic derived features;
-- compact feature projections for an unchanged candidate set.
+- exact derived features;
+- feature projections;
+- judgment results whose declared dependencies and semantic contract are unchanged.
 
-Do not cache a JEV choice across materially different state without an explicit equivalence proof.
+A conservative MVP may invalidate all judgments whenever the snapshot changes.
 
-### 5.4 Parallel read-only computation
+### 5.7 Early cancellation
 
-Independent deterministic feature calculations may run in parallel.
+If a new observation invalidates required judgment dependencies, cancel outstanding work when possible.
 
-Do not parallelize state-changing execution by default.
+Stale results may be retained in diagnostics but not passed to policy as current evidence.
 
-### 5.5 Early cancellation
+### 5.8 Decision stability
 
-If a newer snapshot invalidates the active decision transaction, cancel outstanding JEV/deliberative work when possible.
+Fast loops can oscillate even when judgment outputs differ only slightly.
 
-The result of cancelled or stale model work may be retained for diagnostics but not executed.
+Use deterministic mechanisms such as:
 
-### 5.6 Decision stability
-
-Fast loops can oscillate between semantically equivalent choices.
-
-Use explicit mechanisms such as:
-
-- minimum hold time for a semantic intent where appropriate;
-- hysteresis thresholds;
+- hysteresis;
+- minimum semantic-intent hold time where appropriate;
 - pending-intent suppression;
-- decision-equivalence keys;
+- explicit decision-equivalence keys;
 - state-change requirements before reconsideration.
 
-These mechanisms belong to deterministic runtime policy, not model prompt wording.
+These belong to runtime/policy, not prompt wording.
 
-## 6. Semantic resource ownership
+## 6. Judgment scale and calibration
+
+### 6.1 Probability
+
+Use `PROBABILITY` only when the output contract gives the value probability semantics and policy accepts its calibration status.
+
+### 6.2 Score
+
+Use `SCORE` for relative or ordinal semantic evidence where calibrated probability is not claimed.
+
+Scores should declare comparability, for example:
+
+```text
+comparable only within the same judgment type and schema version
+```
+
+### 6.3 Confidence
+
+Confidence is metadata about a result, not a replacement for calibration.
+
+A policy may use it to request more evidence or escalate, but not as proof.
+
+### 6.4 Combining outputs
+
+Do not perform statistical operations that assume independence unless independence is justified.
+
+In particular, do not blindly multiply probability-like judgments merely because they were evaluated in parallel.
+
+Parallel evaluation is a latency property. Statistical independence is a semantic property.
+
+## 7. Deterministic policy design
+
+Policy owns final semantic branching.
+
+A useful policy contract is:
+
+```text
+Policy.evaluate(
+  state,
+  candidates,
+  constraints,
+  judgments,
+  config
+) -> PolicyDecision
+```
+
+Policy should expose stable reason codes.
+
+Illustrative logic:
+
+```text
+if hard_safety_rule_requires_retreat:
+    SELECT(RETREAT, reason=HARD_SAFETY)
+
+else if required_judgment_missing:
+    OBSERVE_MORE(reason=MISSING_REQUIRED_EVIDENCE)
+
+else if judgment_quality_below_required_level:
+    DELIBERATE(reason=EVIDENCE_QUALITY)
+
+else:
+    evaluate configured semantic thresholds and choose from valid candidates
+```
+
+Policy configuration should be externalized rather than hidden inside adapters.
+
+## 8. Semantic resource ownership
 
 A semantic action may claim one or more resources, for example:
 
@@ -596,19 +846,17 @@ engagement
 inventory_interaction
 ```
 
-The MVP may use a simple single-writer map:
+The MVP may use a single-writer map:
 
 ```text
 resource -> pending_intent_id
 ```
 
-A new action conflicting with an unresolved owner is rejected, deferred, or deliberately replaces it under explicit policy.
+A conflicting new action is rejected, deferred, or deliberately replaces the owner under explicit policy.
 
-Do not infer cancellation just because a newer decision exists.
+## 9. Failure taxonomy
 
-## 7. Failure taxonomy
-
-Use typed failure categories so callers do not need to parse error text.
+Use typed failure categories.
 
 Suggested categories:
 
@@ -617,13 +865,18 @@ OBSERVATION_UNAVAILABLE
 OBSERVATION_CONTRADICTORY
 STATE_STALE
 NO_VALID_CANDIDATE
-INSUFFICIENT_EVIDENCE
-JEV_TIMEOUT
-JEV_TRANSPORT_ERROR
-JEV_INVALID_RESPONSE
-JEV_ABSTAIN
-LOW_DECISION_MARGIN
+INSUFFICIENT_EXACT_EVIDENCE
+JUDGMENT_PLAN_UNAVAILABLE
+JUDGMENT_TIMEOUT
+JUDGMENT_TRANSPORT_ERROR
+JUDGMENT_INVALID_RESPONSE
+JUDGMENT_ABSTAIN
+JUDGMENT_REQUIRED_MISSING
+JUDGMENT_CALIBRATION_INSUFFICIENT
+JUDGMENT_BUNDLE_STALE
+JUDGMENT_BUNDLE_INVALID
 NOVEL_STATE
+POLICY_NO_BRANCH
 VALIDATION_FAILED
 EPOCH_CHANGED
 ACTION_UNSUPPORTED
@@ -638,87 +891,103 @@ Each failure should map to a deterministic next-step policy such as:
 
 ```text
 REOBSERVE
-RETRY_MODEL_ONCE
+REASK_SELECTED_JUDGMENTS
 DELIBERATE
 WAIT
 FAIL_CLOSED
 REQUEST_OPERATOR
 ```
 
-Avoid generic `retry` without class-specific bounds.
+Avoid generic unbounded retry.
 
-## 8. Configuration
+## 10. Configuration
 
 Separate configuration into at least:
 
 ```text
-DecisionPolicy
+JudgmentPolicy
+ActionPolicy
 SafetyPolicy
 FreshnessPolicy
 AdapterConfig
 TracePolicy
 ```
 
-Example decision policy fields:
+Example judgment policy fields:
 
 ```text
-fast_path_max_candidates
-low_stakes_confidence_threshold
-medium_stakes_confidence_threshold
-minimum_margin
-novelty_threshold
-model_deadline_ms
-max_decision_age_ms
+max_parallel_questions
+question_deadline_ms
+bundle_deadline_ms
+allowed_partial_bundle
+required_calibration_by_judgment_type
 ```
 
-Do not hard-code policy thresholds deep inside adapters.
+Example action policy fields:
 
-## 9. Replay model
+```text
+thresholds by judgment type
+stakes-specific evidence requirements
+hysteresis settings
+novelty thresholds
+selector-mode acceptance rules
+```
 
-Replay is part of the MVP because it lets AI-generated implementations evolve safely without requiring live-client trials for every logic change.
+Do not hard-code these values inside provider adapters.
 
-A replay fixture should contain:
+## 11. Replay model
+
+A replay fixture should contain normalized semantics rather than provider-specific wire payloads as primary authority.
 
 ```text
 fixture_id
 input normalized snapshot
 objective
-expected candidate set or constraints on it
-expected route
-optional simulated JEV response
-expected validation result
-optional execution/outcome events
+candidate set expectations
+reduction expectations
+expected judgment plan or constraints on it
+scripted judgment results
+expected bundle validation
+expected policy decision
+expected fresh-state validation
+optional simulated execution/outcome events
 ```
 
 Required fixture classes:
 
-1. deterministic single-candidate selection;
-2. deterministic elimination with reason codes;
-3. no-candidate fail-closed;
-4. bounded JEV selection;
-5. invalid JEV candidate rejection;
-6. JEV abstain;
-7. low-margin escalation;
-8. stale snapshot rejection;
-9. observation-epoch change rejection;
-10. pending-intent duplicate suppression;
-11. command-delivery without final effect;
-12. successful verified action transaction.
+1. deterministic-only decision with zero JEV questions;
+2. one required judgment;
+3. multiple independent judgments in one parallel wave;
+4. optional judgment cancelled after policy short-circuit;
+5. missing required judgment prevents action;
+6. invalid judgment type/range is rejected;
+7. calibration requirement rejection;
+8. stale judgment bundle rejection;
+9. selector mode consumed as evidence, not authority;
+10. observation-epoch change before execution;
+11. pending-intent duplicate suppression;
+12. delivery without final effect;
+13. successful verified transaction.
 
-## 10. Observability and metrics
+## 12. Observability and metrics
 
 Recommended counters:
 
 ```text
-decisions_total
-decisions_deterministic_total
-decisions_jev_total
-decisions_deliberative_total
-decisions_observe_more_total
-decisions_fail_closed_total
-jev_invalid_response_total
-stale_decision_total
-validation_reject_total
+policy_transactions_total
+mechanical_only_transactions_total
+judgment_plans_total
+judgment_questions_total
+judgment_results_answered_total
+judgment_results_abstain_total
+judgment_results_error_total
+judgment_bundles_valid_total
+judgment_bundles_partial_total
+judgment_bundles_stale_total
+selector_judgments_total
+deliberative_escalations_total
+policy_short_circuit_total
+fresh_validation_reject_total
 execution_dispatch_total
 final_effect_success_total
 ```
@@ -726,73 +995,87 @@ final_effect_success_total
 Recommended histograms:
 
 ```text
-decision_end_to_end_ms
+transaction_end_to_end_ms
 normalize_ms
 reduce_ms
-jev_ms
-validate_ms
+judgment_plan_ms
+judgment_question_ms by type
+judgment_required_bundle_ms
+judgment_full_bundle_ms
+policy_ms
+fresh_validate_ms
 execute_to_accept_ms
 execute_to_final_effect_ms
-candidate_count_before_reduction
-candidate_count_after_reduction
-decision_margin
+questions_per_plan
+parallel_ready_questions_per_wave
 ```
 
-The most useful performance ratio is often:
+Useful ratios:
 
 ```text
-model_invocation_rate = decisions_jev_total / decisions_total
+mechanical_resolution_rate
+judgment_invocation_rate
+selector_mode_rate
+optional_cancel_rate
+stale_judgment_discard_rate
 ```
 
-A mature implementation may become faster by reducing this ratio while preserving behavior.
-
-## 11. Versioning
+## 13. Versioning
 
 Version contracts independently where practical:
 
 ```text
 state_schema_version
-decision_request_schema_version
+judgment_question_schema_version
+judgment_result_schema_version
+judgment_bundle_schema_version
+policy_version
 semantic_action_schema_version
 trace_schema_version
 ```
 
-Adapter changes should not force unrelated schema changes.
+Provider changes should not force unrelated schema changes.
 
-A replay fixture must declare the schema version it targets.
+Replay fixtures must declare the contract versions they target.
 
-## 12. Suggested implementation order
+## 14. Suggested implementation order
 
 An AI coding agent should implement in this order unless a concrete constraint requires otherwise:
 
-1. core value objects and schema validation;
-2. knowledge-state semantics;
-3. candidate generator interface;
-4. deterministic reducer framework with reason codes;
-5. decision router;
-6. deterministic/fake JEV adapter;
-7. real JEV adapter behind the same interface;
-8. fresh-state validator;
-9. execution-plan interface and simulated executor;
-10. outcome verifier;
-11. decision trace/replay runner;
-12. only then an EVE-specific observer or physical executor.
+1. core state/value objects and knowledge-state semantics;
+2. candidate generation and deterministic reduction;
+3. judgment output contracts and judgment-question schemas;
+4. deterministic judgment planner;
+5. fake JEV adapter with scripted results;
+6. parallel-capable judgment scheduler and bundle assembler;
+7. judgment bundle validation;
+8. deterministic action policy;
+9. fresh-state validator;
+10. execution-plan interface and simulated executor;
+11. outcome verifier;
+12. trace/replay runner;
+13. optional real JEV adapter;
+14. only then EVE-specific observer or physical executor integration.
 
 This order proves the cognitive architecture before coupling it to volatile client details.
 
-## 13. Things an implementation must not collapse
+## 15. Things an implementation must not collapse
 
 Do not merge these concepts merely to reduce file count:
 
 ```text
 raw observation != normalized state
 unknown != false
+exact fact != probabilistic judgment
+probability != arbitrary score
+confidence != calibration
+parallel evaluation != statistical independence
+judgment result != policy decision
+policy decision != physical authorization
 semantic action != physical step
-model selection != action authorization
 input delivery != command acceptance
 command acceptance != final effect
 state epoch != observation epoch
-confidence != authority
 adapter error != semantic abstention
 replay success != live-client proof
 ```

@@ -2,7 +2,7 @@
 
 This repository is an architecture-first reference for building a low-latency EVE decision system around JEV.
 
-AI coding agents should preserve the decision/execution boundaries rather than optimizing for the smallest number of files or the fastest path to a live client.
+AI coding agents should preserve the evidence/policy/execution boundaries rather than optimizing for the smallest number of files or the fastest path to a live client.
 
 ## Mandatory read order
 
@@ -10,28 +10,35 @@ Before implementing or reviewing a material change, read:
 
 1. `README.md`
 2. `docs/ARCHITECTURE.md`
-3. `docs/DETAILED_DESIGN.md`
-4. `docs/MVP_PLAN.md`
-5. `docs/CLEAN_ROOM.md`
-6. the source, tests, and fixtures for the layer being changed
+3. `docs/JEV_JUDGMENT_MODEL.md`
+4. `docs/DETAILED_DESIGN.md`
+5. `docs/MVP_PLAN.md`
+6. `docs/CLEAN_ROOM.md`
+7. the source, tests, and fixtures for the layer being changed
 
-If documents disagree, `docs/ARCHITECTURE.md` owns architectural invariants; `docs/DETAILED_DESIGN.md` refines implementation contracts; `docs/MVP_PLAN.md` scopes the first implementation.
+If documents disagree, `docs/ARCHITECTURE.md` owns architectural invariants; `docs/JEV_JUDGMENT_MODEL.md` owns JEV evidence semantics; `docs/DETAILED_DESIGN.md` refines implementation contracts; `docs/MVP_PLAN.md` scopes the first implementation.
 
 ## Core invariants
 
 Do not violate these without an explicit architecture change:
 
-1. Deterministic decisions are resolved mechanically when evidence is sufficient.
-2. JEV normally chooses only from a closed semantic candidate set.
-3. JEV does not dispatch physical input.
-4. `UNKNOWN`, `STALE`, and `TRANSITIONAL` are not equivalent to false.
-5. A selected semantic action is revalidated against fresh state before physical execution.
-6. Physical references do not survive an incompatible observation-epoch change.
-7. Semantic actions and physical execution steps remain separate types/concepts.
-8. Input delivery, command acceptance, progress, and final effect are not interchangeable.
-9. Equivalent unresolved physical intents are not blindly repeated.
-10. Provider-specific JEV and EVE integration details remain behind adapters.
-11. Core behavior must be replayable with synthetic fixtures.
+1. Exact facts and mechanically decidable branches are resolved deterministically when evidence is sufficient.
+2. JEV is primarily a probabilistic semantic evidence generator, not an action authority.
+3. JEV questions are decomposed when decomposition creates meaningful reusable evidence or parallelism.
+4. Independent read-only JEV judgments should be parallelizable.
+5. Judgment output type, semantics, scale, freshness, and correlation are explicit.
+6. Numeric scores are not silently treated as calibrated probabilities.
+7. Deterministic policy combines exact state, constraints, candidate space, and validated judgments into a semantic branch.
+8. Closed-candidate selector mode is optional and its output remains policy evidence.
+9. JEV and deliberative adapters never dispatch physical input.
+10. `UNKNOWN`, `STALE`, and `TRANSITIONAL` are not equivalent to false.
+11. A selected semantic action is revalidated against fresh state before physical execution.
+12. Physical references do not survive an incompatible observation-epoch change.
+13. Semantic actions and physical execution steps remain separate types/concepts.
+14. Input delivery, command acceptance, progress, and final effect are not interchangeable.
+15. Equivalent unresolved physical intents are not blindly repeated.
+16. Provider-specific JEV and EVE integration details remain behind adapters.
+17. Core behavior must be replayable with synthetic fixtures.
 
 ## Implementation approach
 
@@ -43,8 +50,8 @@ When modifying code:
 - avoid special-case fixes in adapters when the rule belongs in the core;
 - avoid pushing provider/client-specific concepts into generic schemas;
 - prefer typed reason/failure codes over parsing log text;
-- add or update a replay fixture for subtle state/decision behavior;
-- review the complete decision path for stale-state, duplicate-intent, and verification regressions.
+- add or update replay fixtures for subtle state/judgment/policy behavior;
+- review the complete path for stale evidence, incompatible scales, duplicate intent, and verification regressions.
 
 Do not perform broad refactors merely to make a small change look cleaner.
 
@@ -62,52 +69,76 @@ Prefer bounded increments in this order:
 state/schema
 -> candidate generation
 -> deterministic reduction
--> routing
+-> judgment contracts
+-> judgment planner
 -> fake JEV adapter
--> real JEV adapter
+-> parallel judgment scheduler
+-> judgment bundle validation
+-> deterministic policy
 -> fresh-state validation
 -> simulated execution
 -> outcome verification
 -> replay/metrics
+-> real JEV adapter
 -> EVE observation integration
 -> physical executor integration
 ```
 
-A later layer should not be used to bypass an unfinished earlier contract.
+A later layer must not bypass an unfinished earlier contract.
 
-## JEV requests
+## JEV judgment requests
 
-Keep JEV requests compact and structured.
+Keep JEV requests compact, typed, and semantic.
 
 Do:
 
-- provide the objective;
-- provide closed candidate IDs and semantic descriptions;
-- provide only candidate-discriminating normalized features;
+- ask one semantically defined judgment per question unless a provider-native multi-output call preserves equivalent contracts;
+- provide only features required by that judgment;
+- declare output kind and semantics;
 - preserve explicit unknown/freshness state;
-- bind response to request/snapshot identity;
-- enforce deadlines and strict output parsing.
+- bind results to question, snapshot, and observation epoch;
+- declare required vs optional judgments;
+- expose dependencies so independent judgments can run concurrently;
+- enforce deadlines, cancellation, and strict output parsing.
 
 Do not:
 
-- send raw physical controls as actions;
-- ask JEV to invent executor steps on the normal fast path;
-- treat confidence as authority;
-- accept a candidate ID that was not requested;
-- convert provider error into a guessed action.
+- ask JEV to produce physical executor steps;
+- ask one monolithic "what should I do?" question when meaningful decomposed evidence exists;
+- treat provider confidence as action authority;
+- treat arbitrary numeric scores as probabilities;
+- assume parallel judgments are statistically independent;
+- manufacture a semantic value after provider error;
+- hide an action decision inside an adapter.
+
+## Selector compatibility mode
+
+Closed-candidate selection is allowed when the unresolved semantic property is genuinely a bounded preference.
+
+Represent it as a judgment:
+
+```text
+candidate preference / ranking / per-candidate score
+```
+
+Then pass the validated result into deterministic policy.
+
+Do not create a separate fast path in which selector output bypasses policy and fresh-state validation.
 
 ## Testing expectations
 
-At minimum, changes to the decision pipeline should preserve fixtures for:
+At minimum, changes to the cognition/decision pipeline should preserve fixtures for:
 
 ```text
-deterministic single-candidate bypass
-zero-candidate fail-closed
-bounded JEV choice
-invalid JEV candidate rejection
-JEV abstention
-low-margin escalation
-stale-decision rejection
+deterministic-only branch with zero JEV questions
+single required judgment
+multiple independent parallel judgments
+partial optional bundle + policy short-circuit
+missing required judgment -> no action authority
+invalid judgment output type/range
+calibration requirement rejection
+stale judgment bundle rejection
+selector-as-evidence path
 observation-epoch invalidation
 pending-intent duplicate suppression
 delivery without final effect
@@ -124,9 +155,11 @@ Document:
 
 ```text
 semantic objective
-required evidence
+required exact observations
+required probabilistic judgments
+policy branch
 preconditions
-action
+semantic action
 physical mapping
 command-acceptance evidence
 progress evidence if relevant
@@ -140,24 +173,29 @@ Do not use repeated blind input to compensate for missing observation or verific
 
 Optimize in this order unless measurement shows otherwise:
 
-1. avoid unnecessary JEV calls through deterministic reduction;
-2. minimize JEV context to discriminating features;
-3. cancel stale work;
-4. parallelize independent read-only computation;
-5. cache deterministic derived state within safe snapshot/epoch boundaries;
-6. optimize provider transport/runtime latency;
-7. only then consider more complex speculative techniques.
+1. avoid unnecessary JEV work through exact mechanical reasoning;
+2. ask only the semantic judgments required by policy;
+3. minimize each judgment's feature slice;
+4. parallelize independent read-only judgments;
+5. allow policy completion once required evidence is sufficient;
+6. cancel stale or no-longer-needed optional work;
+7. cache deterministic and judgment-derived state only across proven dependency equivalence;
+8. optimize provider transport/runtime latency;
+9. only then consider more complex speculative techniques.
 
-Any performance optimization must preserve decision traceability and fresh-state validation.
+Any performance optimization must preserve traceability, judgment semantics, deterministic policy, and fresh-state validation.
 
 ## Completion check for a change
 
 Before finalizing a material change, verify:
 
 - the owning invariant is still explicit;
+- probabilistic evidence and deterministic policy remain separate;
+- judgment scales are not silently conflated;
+- independent judgments remain parallelizable where appropriate;
 - semantic and physical layers remain separate;
 - uncertainty is not silently collapsed;
-- stale state cannot cross into execution;
+- stale evidence cannot cross into policy/execution;
 - failures have deterministic next-step policy;
 - replay coverage exists for the changed behavior;
 - no external implementation details leaked into the core;
