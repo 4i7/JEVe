@@ -2,19 +2,17 @@
 
 This document defines the smallest implementation that demonstrates JEVe's architecture without requiring a production EVE client integration.
 
-The MVP is successful when the decision pipeline can be exercised end to end with synthetic observations, a fake or real JEV adapter, a simulated executor, and replayable traces.
+The MVP is successful when the decision pipeline can be exercised end to end with synthetic observations, a fake JEV adapter, deterministic action policy, a simulated executor, and replayable traces.
 
 ## 1. MVP question
 
 The MVP should answer one question convincingly:
 
-> Can a system resolve mechanically decidable choices without a model, invoke JEV only for bounded semantic ambiguity, reject stale/invalid decisions, and verify a semantic outcome through one common pipeline?
+> Can a system resolve exact choices mechanically, ask JEV only for the unresolved semantic evidence, evaluate independent judgments concurrently, combine those judgments through deterministic policy, reject stale/invalid evidence, and verify the resulting semantic outcome through one common pipeline?
 
 If yes, the architecture is viable enough to expand.
 
 ## 2. Required capabilities
-
-The MVP must implement these capabilities at contract level:
 
 ### A. Normalized immutable snapshots
 
@@ -49,88 +47,147 @@ TAKE_ALTERNATE_ROUTE(route_id)
 RETREAT(destination_id)
 ```
 
-This is only a demonstration domain. It should not become a hard-coded architectural dependency.
-
 Acceptance:
 
 - no physical/UI references appear in candidates;
-- candidate IDs are stable within one request;
+- candidate IDs are stable within one policy transaction;
 - unsupported actions are not generated.
 
 ### C. Deterministic reduction
 
-Implement a reducer chain that can reject candidates with typed reason codes.
+Implement a reducer chain that rejects candidates with typed reason codes.
 
-Minimum rules for the demonstration:
+Minimum demonstration rules:
 
 ```text
 invalid precondition
 hard constraint violation
 unavailable resource/action
-strictly dominated option
+strictly dominated exact option
 pending-intent conflict
 ```
 
 Acceptance:
 
-- a one-candidate result bypasses JEV;
+- a fully decidable result bypasses JEV;
 - a zero-candidate result fails closed or requests observation;
 - every elimination is traceable.
 
-### D. Decision routing
+### D. Judgment planning
 
-Implement a deterministic router with at least:
+Implement a deterministic `JudgmentPlanner` that turns unresolved semantic dimensions into typed questions.
+
+For the demonstration domain, support at least:
 
 ```text
-DETERMINISTIC_SELECT
-JEV_FAST
-DELIBERATE
+ROUTE_RISK(route_id) -> SCORE or PROBABILITY-like configured contract
+SHOULD_DISENGAGE(context) -> PROBABILITY or SCORE
+```
+
+The exact semantics must be declared by the output contract.
+
+Acceptance:
+
+- no question asks for physical input;
+- each question has a stable `question_id`;
+- each question declares its output type and semantics;
+- required and optional questions are distinguished;
+- dependencies are explicit.
+
+### E. Parallel-capable JEV adapter boundary
+
+Implement a JEV adapter interface plus a fake adapter.
+
+The fake adapter should support scripted results for:
+
+```text
+answered probability/score
+boolean or enum result
+abstain
+need more information
+invalid type/range
+timeout/error
+calibrated vs uncalibrated metadata
+```
+
+The runtime must be able to execute multiple independent questions concurrently or simulate that concurrency deterministically in tests.
+
+Acceptance:
+
+- independent questions are scheduled in the same wave;
+- provider failure does not synthesize a judgment value;
+- the adapter can be swapped without modifying action policy.
+
+### F. Judgment bundle validation
+
+Assemble results into a `JudgmentBundle`.
+
+Minimum checks:
+
+```text
+question/result correlation
+snapshot/epoch binding
+value kind and range
+required result presence
+calibration requirement
+freshness
+```
+
+Acceptance:
+
+- missing required judgment prevents action authority;
+- invalid numeric semantics are rejected;
+- optional missing judgments may be accepted only when policy allows it;
+- stale bundles do not enter policy as current evidence.
+
+### G. Deterministic action policy
+
+Implement a deterministic policy consuming:
+
+```text
+fresh normalized state
+hard constraints
+surviving semantic candidates
+validated judgment bundle
+configuration
+```
+
+and returning one of:
+
+```text
+SELECTED
 OBSERVE_MORE
+DELIBERATE
+WAIT
 FAIL_CLOSED
 ```
 
-The MVP may stub `DELIBERATE`, but the route must exist.
+Acceptance:
+
+- identical inputs/configuration produce the same branch;
+- JEV output alone does not directly dispatch or authorize physical action;
+- hard constraints dominate model evidence;
+- policy can decline to act when evidence is insufficient.
+
+### H. Optional selector judgment
+
+Support one compatibility scenario where JEV returns a bounded candidate preference or ranking.
 
 Acceptance:
 
-- one candidate routes to deterministic selection;
-- multiple low-stakes candidates can route to JEV;
-- stale/critical-unknown state can route to observation rather than JEV;
-- configured high-stakes/novel cases can route away from the fast path.
+- the selector result is represented as semantic evidence;
+- deterministic policy still owns acceptance/rejection and final branch;
+- an out-of-set candidate is rejected.
 
-### E. JEV adapter boundary
-
-Implement an adapter interface plus a fake adapter.
-
-The fake adapter should support scripted results:
-
-```text
-valid selection
-abstain
-invalid candidate ID
-timeout/error
-scored low-margin selection
-scored high-margin selection
-```
-
-A real JEV provider adapter may be added, but it is not required for the architecture MVP.
-
-Acceptance:
-
-- invalid output cannot cross validation;
-- provider failure does not select an arbitrary fallback candidate;
-- the adapter can be swapped without modifying core decision logic.
-
-### F. Fresh-state validation
+### I. Fresh-state validation
 
 Before compilation, validate the selected semantic action against a fresh snapshot.
 
 Minimum checks:
 
 ```text
-request/response correlation
-candidate membership
-precondition still true
+selected candidate still exists
+preconditions still hold
 observation epoch compatible
 state freshness acceptable
 no conflicting pending intent
@@ -138,23 +195,21 @@ no conflicting pending intent
 
 Acceptance:
 
-- an epoch change rejects an otherwise valid model choice;
+- an epoch change rejects an otherwise valid policy decision;
 - a vanished target/precondition rejects execution;
 - validation failure returns to observation or fail-closed policy.
 
-### G. Simulated action compilation and execution
+### J. Simulated action compilation and execution
 
 Implement a test action compiler and simulated executor.
 
-The compiler turns a semantic action into a synthetic `ExecutionPlan`; the executor applies controlled simulated state transitions.
-
 Acceptance:
 
-- compilation cannot silently change the selected semantic action;
-- plan steps are distinct from semantic actions;
-- an action can be delivered without immediately implying success.
+- compilation cannot silently change the semantic action;
+- physical plan steps are distinct from semantic actions;
+- delivery can occur without implying success.
 
-### H. Outcome verification
+### K. Outcome verification
 
 Demonstrate the difference between:
 
@@ -165,32 +220,29 @@ PROGRESSING
 FINAL_EFFECT
 ```
 
-Not every example needs every intermediate state, but at least one fixture should distinguish delivery from final effect.
-
 Acceptance:
 
 - final success requires the configured semantic final-effect predicate;
-- a stalled or unaccepted action does not become success due to elapsed time alone.
+- elapsed time alone cannot promote a stalled action to success.
 
-### I. Decision trace and replay
+### L. Decision trace and replay
 
-Persist or emit a structured trace that can be replayed offline.
+Persist or emit a structured trace.
 
 Acceptance:
 
-- the trace records candidate generation, reduction, routing, optional JEV result, validation, and outcome;
-- the same fixture with a scripted adapter produces the same semantic result;
+- the trace records mechanical reduction, judgment plan, per-question results, bundle validation, policy branch, fresh-state validation, and outcome;
+- scripted replay produces the same policy result;
 - replay does not require the live EVE client.
 
 ## 3. Suggested implementation skeleton
-
-A minimal repository after implementation might look like:
 
 ```text
 README.md
 AGENTS.md
 docs/
   ARCHITECTURE.md
+  JEV_JUDGMENT_MODEL.md
   DETAILED_DESIGN.md
   MVP_PLAN.md
   CLEAN_ROOM.md
@@ -200,8 +252,8 @@ src/
     state
     candidates
     reduction
-    routing
-    decisions
+    judgments
+    policy
     validation
     actions
     verification
@@ -212,18 +264,22 @@ src/
     executor
   runtime/
     decision-loop
+    judgment-scheduler
     pending-intents
   replay/
     runner
 
 fixtures/
-  deterministic-single-candidate
-  jev-bounded-choice
-  jev-invalid-response
-  jev-low-margin
-  stale-decision
+  deterministic-only
+  single-judgment
+  parallel-judgment-bundle
+  optional-short-circuit
+  missing-required-judgment
+  invalid-judgment-output
+  calibration-rejection
+  stale-bundle
+  selector-evidence
   epoch-change
-  pending-intent
   delivered-not-complete
   verified-complete
 
@@ -234,96 +290,125 @@ Do not create empty architectural layers merely to match this tree. Add a module
 
 ## 4. Recommended first scenario
 
-Use a deliberately small synthetic navigation-choice scenario.
+Use a deliberately small synthetic navigation/risk scenario.
 
-Example state:
+Example exact state:
 
 ```text
 objective: reach destination while respecting configured risk ceiling
-current_state: stable
-route A: available, shorter, risk feature uncertain/high
-route B: available, longer, risk feature known/lower
+route A: reachable, shorter
+route B: reachable, longer
 WAIT: available
+RETREAT: available
+hard constraints: none violated
 ```
 
-The point is not to model EVE routing perfectly. The point is to exercise all three kinds of reasoning:
+Exact code can establish reachability, length, and candidate legality.
 
-- deterministic removal of impossible choices;
-- JEV comparison of bounded semantic alternatives when risk interpretation remains ambiguous;
-- fresh-state rejection if the world changes before execution.
+Semantic uncertainty remains:
 
-A second scenario should be entirely deterministic so the model is demonstrably bypassed.
+```text
+Q1: contextual risk of route A
+Q2: contextual risk of route B
+Q3: whether current context supports disengagement
+```
+
+`Q1`, `Q2`, and `Q3` should be independent enough for the demonstration to run in one judgment wave.
+
+A deterministic policy then combines the results. For example, under an explicitly configured demonstration policy:
+
+```text
+if disengage judgment exceeds threshold:
+    RETREAT
+else if route A and B risk values are comparable:
+    choose lower-risk allowed route
+else:
+    WAIT / OBSERVE_MORE
+```
+
+The thresholds are test configuration, not architectural constants.
+
+A second scenario must be entirely deterministic so JEV call count is zero.
 
 ## 5. Required replay fixtures
 
-The initial suite should cover at least:
-
 | Fixture | Expected property |
 |---|---|
-| deterministic-single | one surviving candidate; JEV call count = 0 |
-| no-valid-candidate | no improvisation; fail closed/observe more |
-| bounded-jev-choice | selected ID belongs to request candidate set |
-| invalid-jev-id | response rejected |
-| jev-abstain | no forced physical action |
-| low-margin | configured escalation path used |
-| stale-before-validation | decision discarded |
+| deterministic-only | exact policy branch; JEV question count = 0 |
+| single-judgment | one required semantic judgment drives policy input |
+| parallel-bundle | 2+ independent questions scheduled in one wave |
+| optional-short-circuit | policy completes after required results; optional work may cancel |
+| required-missing | no action authority when required evidence is absent |
+| invalid-output | wrong result type/range rejected |
+| calibration-rejection | policy requiring calibrated evidence rejects insufficient metadata |
+| stale-bundle | stale semantic evidence discarded |
+| selector-evidence | bounded selector output enters policy as evidence only |
 | epoch-change | physical execution prohibited until re-resolution |
 | duplicate-pending-intent | duplicate physical action suppressed |
 | delivered-not-complete | delivery not counted as final effect |
-| verified-final-effect | transaction reaches success only from observed semantic outcome |
+| verified-final-effect | success only from observed semantic outcome |
 
 ## 6. Minimum metrics
-
-Even the MVP should expose enough metrics to answer whether the architecture is becoming faster.
 
 Track:
 
 ```text
-total decisions
-mechanically resolved decisions
-JEV-invoked decisions
-deliberative/escalated decisions
-failed-closed decisions
-candidate count before/after reduction
-JEV latency
-end-to-end decision latency
-stale decisions discarded
-validation rejections
+policy transactions
+mechanical-only transactions
+judgment plans
+judgment question count
+questions per plan
+parallel-ready questions per wave
+judgment answer/abstain/error count
+required-bundle wall-clock latency
+full-bundle wall-clock latency
+policy short-circuits
+selector-mode usage
+stale judgment discards
+fresh validation rejections
 verified final effects
+end-to-end decision latency
 ```
 
-Two particularly useful ratios:
+Useful ratios:
 
 ```text
-mechanical_resolution_rate = deterministic_decisions / total_decisions
-model_invocation_rate = JEV_decisions / total_decisions
+mechanical_resolution_rate = mechanical_only / policy_transactions
+judgment_invocation_rate = transactions_with_judgments / policy_transactions
+selector_mode_rate = selector_transactions / transactions_with_judgments
+optional_cancel_rate = cancelled_optional_questions / optional_questions_started
 ```
 
-For a stable domain, successful maturation should often increase the first ratio and reduce unnecessary model calls.
+For a stable domain, maturation should often increase mechanical resolution and reduce unnecessary semantic work.
 
 ## 7. Performance targets
 
 Do not hard-code universal millisecond targets before measuring the chosen runtime and JEV provider.
 
-Instead define budgets per deployment:
+Define budgets per deployment:
 
 ```text
 observation_budget
-mechanical_decision_budget
-JEV_fast_path_budget
+mechanical_prepass_budget
+judgment_plan_budget
+required_bundle_budget
+policy_budget
 fresh_validation_budget
 execution_start_budget
 ```
 
-The architectural performance acceptance is qualitative at first:
+The architectural performance acceptance is initially qualitative:
 
-1. deterministic choices avoid JEV latency entirely;
-2. JEV requests contain only compact normalized decision context;
-3. stale JEV work can be cancelled/discarded;
-4. model latency does not block passive observation;
-5. physical execution is not repeated simply because cognition runs faster.
+1. exact choices avoid JEV latency entirely;
+2. only unresolved semantic questions invoke JEV;
+3. independent questions are parallelizable;
+4. each question receives compact normalized context;
+5. policy may complete when required evidence is sufficient without waiting for optional work;
+6. stale JEV work can be cancelled/discarded;
+7. model latency does not block passive observation;
+8. physical execution is not repeated simply because cognition runs faster.
 
-After measurement, convert these into explicit numeric SLOs.
+After measurement, convert these into numeric SLOs.
 
 ## 8. What not to build in the MVP
 
@@ -334,29 +419,29 @@ Do not expand the first implementation into:
 - generalized screen automation;
 - autonomous long-horizon planning;
 - automatic rule learning/promotion;
+- statistical probability fusion without justified assumptions;
 - multi-client parallel physical control;
 - a large plugin framework;
 - a database unless traces actually require one;
-- provider-specific features leaked into the core.
-
-These can be added after the architecture is proven.
+- provider-specific semantics leaked into the core.
 
 ## 9. AI coding-agent workflow
-
-When asking an AI to turn this design into code, give it a bounded increment.
 
 Recommended order:
 
 ```text
 Increment 1: core schemas + knowledge-state tests
 Increment 2: candidate/reduction framework + reason-code fixtures
-Increment 3: router + fake JEV adapter
-Increment 4: decision response validation + freshness/epoch validation
-Increment 5: simulated compiler/executor/verifier
-Increment 6: trace + replay runner
-Increment 7: optional real JEV adapter
-Increment 8: optional EVE observer integration
-Increment 9: optional real executor integration
+Increment 3: judgment contracts + deterministic judgment planner
+Increment 4: fake JEV adapter + parallel-capable scheduler
+Increment 5: judgment bundle validation + calibration/freshness rules
+Increment 6: deterministic action policy + selector-as-evidence compatibility
+Increment 7: fresh-state validation
+Increment 8: simulated compiler/executor/verifier
+Increment 9: trace + replay runner + metrics
+Increment 10: optional real JEV adapter
+Increment 11: optional EVE observer integration
+Increment 12: optional real executor integration
 ```
 
 For each increment, require:
@@ -372,16 +457,19 @@ For each increment, require:
 
 The MVP is complete when all of the following are true:
 
-- a deterministic scenario completes without invoking JEV;
-- an ambiguous scenario invokes JEV with a closed candidate set;
-- invalid or out-of-set JEV output is rejected;
-- low-confidence/low-margin or configured high-risk output can be escalated;
-- a decision becomes unusable after an incompatible observation epoch change;
-- semantic action compilation is visibly separate from model selection;
+- a deterministic scenario completes without JEV;
+- an ambiguous scenario produces typed semantic judgment questions rather than one mandatory action-selection prompt;
+- 2+ independent questions can be evaluated in parallel;
+- invalid, stale, missing-required, or semantically incompatible judgment output cannot create action authority;
+- deterministic policy combines judgments with exact state and constraints;
+- selector mode, when used, remains evidence rather than direct execution authority;
+- policy can return observe-more/deliberate/wait/fail-closed instead of forcing an action;
+- a decision becomes unusable after an incompatible observation-epoch change;
+- semantic action compilation is visibly separate from policy and JEV;
 - delivery, acceptance, progress, and final effect are not conflated;
-- replay fixtures reproduce the decision logic offline;
+- replay fixtures reproduce policy behavior offline;
 - the core has no dependency on a particular UI automation implementation;
 - the core has no dependency on another repository's source-specific concepts;
 - an AI can read the repository documents and identify the next implementation layer without inventing missing architecture.
 
-At that point, the next work should be selected based on measured bottlenecks and the intended EVE integration, not by adding architecture for its own sake.
+At that point, choose further work from measured bottlenecks and the intended EVE integration rather than adding abstraction for its own sake.
