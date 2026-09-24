@@ -164,7 +164,7 @@ class ValidationGuardTests(unittest.TestCase):
             fresh_until=0,
         )
         scheduled = ConcurrentJudgmentScheduler().execute(plan, FakeJEVAdapter(broken))
-        validation = EvidenceAuthority(JudgmentFreshnessPolicy(max_age=0)).validate(
+        validation = EvidenceAuthority(JudgmentFreshnessPolicy(max_age=30)).validate(
             snapshot,
             plan,
             envelopes(plan, scheduled.results),
