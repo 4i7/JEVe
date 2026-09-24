@@ -109,11 +109,15 @@ flowchart TD
     R -->|semantic uncertainty remains| JP[Judgment planner]
 
     subgraph JPB[JEV provider boundary]
+        direction TB
+
+        JA["concurrent where independent<br/>correlation != independence<br/>optional work may short-circuit"]
+
         Q1[JEV judgment A]
         Q2[JEV judgment B]
         Q3[JEV judgment C]
         QN[JEV judgment ...]
-        JA["concurrent where independent<br/>correlation != independence<br/>optional work may be cancelled after policy sufficiency"]
+
         JA -.-> QN
     end
 
@@ -128,6 +132,7 @@ flowchart TD
     QN --> JB
 
     JB -->|policy-usable evidence| P
+
     P -->|insufficient / novel / high stakes| D[Deliberative escalation]
     D --> P
 
@@ -144,9 +149,6 @@ flowchart TD
     T[Trace / replay]
     N -.-> T
     JB -.-> T
-    P -.-> T
-    V -.-> T
-    A -.-> T
     Q -.-> T
 ```
 
