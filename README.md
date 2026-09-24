@@ -108,28 +108,46 @@ flowchart TD
     R -->|fully decidable| P[Deterministic policy]
     R -->|semantic uncertainty remains| JP[Judgment planner]
 
-    JP --> Q1[JEV judgment A]
-    JP --> Q2[JEV judgment B]
-    JP --> Q3[JEV judgment C]
-    JP --> QN[JEV judgment ...]
+    subgraph JPB[JEV provider boundary]
+        Q1[JEV judgment A]
+        Q2[JEV judgment B]
+        Q3[JEV judgment C]
+        QN[JEV judgment ...]
+        JA["concurrent where independent<br/>correlation != independence<br/>optional work may be cancelled after policy sufficiency"]
+        JA -.-> QN
+    end
+
+    JP --> Q1
+    JP --> Q2
+    JP --> Q3
+    JP --> QN
 
     Q1 --> JB[Judgment bundle validator]
     Q2 --> JB
     Q3 --> JB
     QN --> JB
 
-    JB --> P
+    JB -->|policy-usable evidence| P
     P -->|insufficient / novel / high stakes| D[Deliberative escalation]
     D --> P
 
-    P -->|semantic action| V[Fresh-state validation]
+    P -->|semantic action| V[Decision + fresh-state validation]
     P -->|observe more / fail closed| O
 
     V -->|invalid or stale| O
-    V -->|valid| A[Semantic action compiler]
+    V -->|valid| I[Pending intent / resource admission]
+    I -->|admitted| A[Semantic action compiler]
     A --> E[Executor boundary]
     E --> Q[Outcome verifier]
     Q --> O
+
+    T[Trace / replay]
+    N -.-> T
+    JB -.-> T
+    P -.-> T
+    V -.-> T
+    A -.-> T
+    Q -.-> T
 ```
 
 The architecture remains a **deterministic -> probabilistic evidence -> deterministic** sandwich:
