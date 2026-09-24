@@ -1,8 +1,8 @@
 # Architecture validation report
 
-This report records the executable architecture-validation slice requested for JEVe. It is not a feature-completeness or EVE-integration report.
+This report records the executable architecture-validation slice for JEVe. It is not a feature-completeness or real EVE/JEV integration report.
 
-The slice deliberately uses one synthetic navigation/risk domain and Python standard-library code only. It exists to test whether the documented ownership boundaries remain coherent when represented as executable contracts.
+The slice deliberately uses one synthetic navigation/risk domain and Python standard-library code only. Its purpose is to test whether the documented authority, freshness, evidence, policy, execution, and replay boundaries remain coherent when expressed as executable contracts.
 
 ## 1. Implemented surface
 
@@ -14,269 +14,282 @@ Implements the value objects and authority-carrying types exercised by the slice
 - immutable `StateSnapshot`, `RouteState`, `Objective`, and `HardConstraints`;
 - semantic `SemanticAction` values for `WAIT`, `TAKE_ROUTE(route_id)`, and `RETREAT(destination_id)`;
 - stable reduction reason codes;
-- `JudgmentOutputContract`, `JudgmentQuestion`, `JudgmentPlan`, `JudgmentResult`, raw `JudgmentBundle`, and `ValidatedJudgmentBundle`;
-- policy, fresh-validation, execution-plan, delivery-evidence, and outcome-verification contracts.
+- typed judgment questions/results/contracts and raw `JudgmentBundle`;
+- `PolicyUsableJudgmentBundle` as the single policy evidence capability;
+- calibration provenance and calibration-policy contracts;
+- explicit policy decision binding and temporal freshness fields;
+- fresh-validation, pending-intent, resource-ownership, execution, outcome, trace, and replay contracts.
 
 ### `src/jeve/pipeline.py`
 
 Implements only the exercised architecture:
 
-- deterministic candidate generation;
-- deterministic reduction;
+- deterministic candidate generation and reduction;
 - deterministic judgment planning;
 - fake/scripted JEV adapter;
-- dependency-wave judgment scheduler;
-- judgment-bundle validation;
-- deterministic policy;
-- fresh-state validation;
-- simulated semantic-action compilation;
-- simulated delivery;
-- final-effect verification.
+- dependency-wave scheduling with actual concurrent execution inside a wave;
+- optional-evidence short-circuit with cooperative cancellation;
+- judgment-bundle validation and validator-owned evidence freshness;
+- deterministic policy with complete semantic/config/evidence binding;
+- fresh-state validation including decision/evidence expiry checks;
+- pending-intent duplicate suppression and semantic-resource admission;
+- simulated semantic-action compilation and delivery;
+- final-effect verification;
+- trace assembly and deterministic replay.
 
 ### `tests/test_architecture_slice.py`
 
-Contains the nine requested evaluation fixtures plus narrow invariant tests required to demonstrate state semantics, reducer reason codes, and fresh precondition/constraint invalidation.
+Contains the original nine required evaluation fixtures plus authority/lifecycle regression tests for the hardening work.
 
 ### `.github/workflows/architecture-validation.yml`
 
-Runs the standard-library test suite on Python 3.12. GitHub Actions are pinned to resolved commit SHAs rather than floating tags.
+Runs the standard-library test suite on Python 3.12. GitHub Actions are pinned to immutable commit SHAs.
 
 ## 2. Architecture that translated cleanly
 
 ### Deterministic -> probabilistic evidence -> deterministic policy
 
-This boundary translated directly. Candidate generation and exact reduction produce a bounded semantic candidate set. The judgment planner sees only unresolved semantic dimensions. The JEV adapter returns evidence. The deterministic policy is the first component that selects a semantic action.
+Candidate generation and exact reduction produce a bounded semantic candidate set. The judgment planner sees only unresolved semantic dimensions. JEV returns typed evidence. The bundle validator decides whether that evidence is policy-usable. Deterministic policy is the first component that selects a semantic action.
 
 No JEV result type contains an execution hook, compiler reference, or physical input value.
 
-Evidence:
-
-- `JudgmentPlanner.plan`
-- `FakeJEVAdapter.evaluate`
-- `JudgmentBundleValidator.validate`
-- `DeterministicPolicy.decide`
-- fixture `test_fixture_2_parallel_route_risk_is_one_wave_and_policy_selects_semantic_action`
-
 ### Zero-JEV mechanical branch
 
-The deterministic-only fixture resolves exact route risk mechanically. The planner emits no questions and the fake adapter call count remains zero.
+A deterministic-only fixture resolves exact route risk mechanically. The planner emits no questions and the adapter call count remains zero.
 
-Evidence:
+### Concurrent judgments without independence assumptions
 
-- fixture `test_fixture_1_deterministic_only_uses_zero_jev_calls`
+Independent scheduling dependencies can be executed concurrently in one wave. Statistical correlation is represented separately from scheduling dependency.
 
-### Independent judgment scheduling
-
-The two route-risk judgments and disengage judgment have no dependencies and therefore occupy one scheduler wave. The contract does not require serialization or wall-clock concurrency.
-
-Evidence:
-
-- `JudgmentScheduler.build_waves`
-- fixture `test_fixture_2_parallel_route_risk_is_one_wave_and_policy_selects_semantic_action`
+The route-risk and disengagement judgments share a correlation key in the synthetic scenario, so same-wave execution does not imply independent probabilities.
 
 ### Semantic action / physical execution separation
 
-`SemanticAction` contains semantic identifiers only. `ExecutionPlan` is produced only after `ValidatedDecision`. The simulated physical step appears only in the compiler output.
+`SemanticAction` contains semantic identifiers only. Physical steps appear only after fresh validation and pending-intent admission.
 
-Evidence:
-
-- `SemanticAction`
-- `ValidatedDecision`
-- `SimulatedActionCompiler.compile`
+Compilation may not silently replace one semantic action with another.
 
 ### Delivery / final effect separation
 
-Delivery evidence is represented independently from command acceptance, progress, and final effect. Success is true only when final semantic effect is verified.
+Delivery evidence remains distinct from command acceptance, progress, and final effect. Final success requires an observed semantic final effect.
 
-Evidence:
+## 3. Authority and lifecycle findings
 
-- `ExecutionEvidence`
-- `OutcomeVerifier.verify`
-- fixtures `test_fixture_8_delivered_does_not_mean_final_effect` and `test_fixture_9_success_requires_verified_final_effect`
+### Raw evidence vs policy-usable evidence
 
-## 3. Architecture friction
+The initial slice exposed a real authority gap: a structurally validated bundle was still too easy to construct or pass through an older path.
 
-### Friction A: raw bundle and policy-usable bundle are too easy to conflate in the documents
+The final slice removes the temporary dual path. Policy consumes only `PolicyUsableJudgmentBundle`, issued by `JudgmentBundleValidator` after the configured checks pass.
 
-Documented assumption:
+The constructor seal is an application-level invariant that prevents accidental ordinary construction. It is not claimed as a hostile-code security boundary.
 
-`JudgmentBundle` carries a `validation_status`, and deterministic policy consumes a validated judgment bundle.
+### Freshness has explicit owners
 
-Implementation pressure:
+Freshness is split by responsibility:
 
-If raw and validated bundles share one structural type, callers can accidentally pass an invalid, partial, or stale bundle into policy and rely on runtime checks at every call site.
+```text
+provider/result -> completion time and provider metadata
+bundle validator -> semantic judgment evidence lifetime
+policy -> decision lifetime
+fresh-state validator -> execution-time admission against current state/evidence
+```
 
-Assessment:
+Provider-supplied expiry is not treated as policy authority.
 
-Missing contract.
+### Provider failure is not stale evidence
 
-Recommended change:
+A provider `ERROR` means no semantic answer exists. It is classified as provider/evidence failure and required-evidence absence.
 
-Keep `JudgmentBundle` as assembled evidence and introduce an explicit `ValidatedJudgmentBundle` (or equivalent capability type) that can be constructed only by bundle validation. Policy should consume the validated type.
+Only an answered semantic value can become stale.
 
-The slice implements this distinction.
+### Policy decisions are bound to what they consumed
 
-### Friction B: judgment freshness needs an explicit owner
+A selected decision records bindings for:
 
-Documented assumption:
+```text
+canonical normalized semantic input fingerprint
+policy configuration fingerprint
+created_at / expires_at
+consumed judgment result identity
+consumed judgment value/type
+judgment equivalence key
+dependency key
+provider/model/schema identity
+evidence valid-until time
+```
 
-Questions and results are bound to snapshot/epoch and carry freshness/dependency semantics.
+Fresh validation rejects the old decision when any bound policy input changes or expires.
 
-Implementation pressure:
+### Canonical binding is explicit
 
-The minimum result schema does not fully specify where the concrete expiration decision lives. Validation needs a deterministic comparison point.
+Semantic fingerprints use canonical JSON-derived material before SHA-256 hashing. They do not depend on Python `repr(...)` stability.
 
-Assessment:
+The current fingerprint is intentionally conservative and may include more normalized semantic state than a future fine-grained dependency model requires.
 
-Missing contract / lifecycle detail.
+### Calibration requires provenance
 
-Recommended change:
+`CALIBRATED` is insufficient by itself. A calibrated result also carries provenance including authority, basis, provider/model/schema identity, evaluation population, metric name, and metric value.
 
-State explicitly that freshness policy is declared by the question/plan or policy configuration, normalized into a result-validity deadline/dependency token, and enforced by the bundle validator. The slice uses `fresh_until` only as the smallest executable representation of that contract.
+`CalibrationPolicy` decides which provenance is accepted for the current deployment/test configuration.
 
-### Friction C: provider failure and stale semantic evidence are different failure classes
+This validates provenance integrity and policy compatibility; it does not claim that one universal calibration method is correct for every provider or deployment.
 
-Documented assumption:
+### Correlation is not silently ignored
 
-Provider failure remains provider failure and must not become a guessed semantic value.
+The current deterministic policy does not statistically fuse route-risk/disengagement probabilities.
 
-Implementation pressure:
+The synthetic probability-fusion helper rejects multiplication when the same correlation key appears and requires an explicit independence justification before any product of supposedly independent probabilities is permitted.
 
-A naive validator can apply freshness checks to every provider result object, causing an `ERROR` result with no semantic value to be classified as stale instead of missing required evidence.
+### Judgment reuse is fail-closed
 
-Assessment:
+Cross-snapshot reuse remains disabled by default.
 
-Implementation detail that exposes an important semantic distinction.
+When explicitly enabled, the synthetic compatibility check requires compatible:
 
-Recommended change:
+```text
+answer status
+freshness
+observation epoch
+provider identity
+model identity
+schema version
+equivalence key
+dependency key
+```
 
-Freshness applies to returned semantic evidence. Provider `ERROR`/required `ABSTAIN` should remain evidence absence/failure unless the contract separately defines transport-result expiry.
-
-The first executable test pass exposed this distinction; the validator was corrected so only `ANSWERED` semantic values participate in result-freshness validation.
-
-### Friction D: generic `required_facts` on every semantic action is not needed yet
-
-Documented assumption:
-
-The detailed design illustrates `SemanticAction.required_facts`.
-
-Implementation pressure:
-
-For this slice, route/retreat preconditions already have a clear owner in normalized state, deterministic reduction, and fresh-state validation. Copying the same predicates into each action would duplicate information.
-
-Assessment:
-
-Unnecessary abstraction for the current slice.
-
-Recommended change:
-
-Do not require `required_facts` as stored action data until an implementation needs portable/declarative precondition descriptions. Preserve the invariant that fresh preconditions are rechecked, not the illustrative storage shape.
+This demonstrates the reuse boundary without making reuse a default optimization.
 
 ## 4. Invariants actually demonstrated
 
 | Invariant | Executable evidence |
 |---|---|
-| `KNOWN`, `UNKNOWN`, `STALE`, `TRANSITIONAL` remain distinct | `test_knowledge_states_remain_distinct` |
-| no unknown-like value silently becomes false | `Knowledge` construction rules and reducer handling |
-| state snapshot is immutable by implementation | frozen dataclasses in `model.py` |
-| semantic candidates contain no physical/provider values | `SemanticAction` |
-| reducer emits stable typed elimination reasons | `test_reducer_emits_stable_reason_codes` |
-| exact branch can use JEV call count = 0 | fixture 1 |
-| judgment plan is deterministic for fixed inputs | deterministic question IDs/order and plan ID |
-| ambiguous route scenario produces three independent questions | fixture 2 |
-| one execution wave contains all three independent questions | fixture 2 |
-| provider failure does not synthesize semantic value | `FakeJEVAdapter` + bundle validation |
-| missing required judgment has no action authority | fixture 3 |
-| SCORE cannot silently satisfy PROBABILITY | fixture 4 |
-| calibrated probability requirement is enforced | fixture 5 |
-| stale semantic evidence cannot enter policy | fixture 6 |
-| JEV output never dispatches execution | type/ownership path through policy and validation |
-| deterministic policy selects the semantic branch | fixture 2 |
-| observation-epoch change invalidates an otherwise valid decision | fixture 7 |
-| changed precondition rejects execution | `test_fresh_validation_rejects_precondition_and_constraint_changes` |
-| incompatible hard-constraint change rejects execution | same test |
-| stale decision is rejected rather than repaired into another action | `FreshStateValidator` returns failure only |
-| `SemanticAction` and `ExecutionPlan` remain separate | compiler boundary |
-| `DELIVERED` is not semantic success | fixture 8 |
-| success requires observed `FINAL_EFFECT` | fixture 9 |
+| `KNOWN`, `UNKNOWN`, `STALE`, `TRANSITIONAL` remain distinct | knowledge-state tests |
+| unknown-like values do not silently become false | construction/reducer tests |
+| normalized snapshots are immutable | frozen dataclasses |
+| semantic candidates contain no physical/provider values | semantic action contracts |
+| reducer emits stable typed elimination reasons | reducer reason-code fixture |
+| exact branch can use JEV call count = 0 | deterministic-only fixture |
+| judgment plan is deterministic for fixed inputs | deterministic IDs/order |
+| independent questions execute concurrently in one wave | scheduler concurrency fixture |
+| same-wave execution does not imply probability independence | correlation tests |
+| provider failure does not synthesize semantic value | provider-failure fixture |
+| provider failure is distinct from stale answered evidence | validation tests |
+| missing required judgment has no action authority | required-missing fixture |
+| SCORE cannot silently satisfy PROBABILITY | semantic-output fixture |
+| calibrated evidence requires accepted provenance | calibration tests |
+| validator owns judgment evidence freshness | freshness tests |
+| policy consumes only authority-issued usable evidence | capability-construction test |
+| policy config is bound into the decision | config-drift test |
+| consumed judgment identity/value is bound into the decision | evidence-drift test |
+| decision TTL is enforced before execution | decision-expiry test |
+| consumed judgment expiry is rechecked before execution | evidence-expiry test |
+| normalized semantic input drift invalidates old decision | semantic-drift test |
+| observation-epoch change invalidates an otherwise valid decision | epoch-change fixture |
+| semantic fingerprints are canonical/stable for equivalent input | canonicalization test |
+| correlated probabilities are not multiplied as independent | fusion rejection test |
+| cross-snapshot reuse is fail-closed by default | reuse tests |
+| optional work can be cancelled after required evidence is sufficient | short-circuit fixture |
+| duplicate unresolved state-changing intent is suppressed | pending-intent test |
+| conflicting semantic resource ownership is rejected | resource-admission test |
+| semantic action and physical plan remain separate | compiler boundary |
+| `DELIVERED` is not semantic success | delivery fixture |
+| success requires observed `FINAL_EFFECT` | final-effect fixture |
+| replay reproduces the deterministic decision under identical inputs | trace/replay test |
 
-## 5. Unproven assumptions
+## 5. Original nine requested fixtures
+
+The original architecture-validation request remains covered:
+
+1. deterministic-only -> zero JEV calls;
+2. ambiguous route risk -> multiple typed questions in one wave;
+3. missing required judgment -> no action authority;
+4. invalid semantic output kind -> rejected;
+5. insufficient calibration -> rejected;
+6. stale bundle/evidence -> rejected;
+7. observation-epoch change -> execution rejected;
+8. delivered but incomplete -> not success;
+9. verified final effect -> success only after semantic verification.
+
+## 6. Lifecycle increments now represented
+
+The previously proposed next sequence has been implemented synthetically:
+
+```text
+trace/replay
+-> optional-evidence short-circuit + cancellation
+-> pending-intent / semantic-resource ownership
+```
+
+This means the next uncertainty is no longer basic core lifecycle ownership.
+
+## 7. Remaining unproven assumptions
 
 This slice intentionally does not validate:
 
-- real EVE observation, normalization, entity identity, or observation-epoch advancement rules;
-- real JEV transport, provider batching, cancellation, timeout behavior, or calibration quality;
-- statistical interpretation/correlation between parallel judgments;
-- optional-judgment cancellation and policy short-circuit timing;
+- real EVE observation, entity identity, normalization, or observation-epoch advancement rules;
+- real JEV network/transport timeout semantics;
+- cancellation after a request has reached a real provider;
+- rate-limit admission/backoff;
+- provider-native batching or multi-output calls;
+- partial/streaming completion semantics;
+- real provider/model/schema identity discovery;
+- real calibration-study ingestion and empirical quality;
+- production wall-clock performance under real provider concurrency;
 - deliberative escalation;
-- selector-compatibility mode;
-- pending-intent/resource ownership and duplicate suppression;
-- replay persistence/metrics storage;
-- provider-specific or physical executor integration;
-- long-running state transitions;
-- performance under real latency or concurrency.
+- selector-compatibility mode against a real provider;
+- persistence format/durability for traces;
+- real physical executor integration;
+- long-running EVE state transitions.
 
-These remain future work, not failures of the current slice.
+These remain future integration/qualification work, not hidden assumptions of the current core path.
 
-## 6. Overengineering findings
+## 8. Overengineering findings
 
-The large illustrative directory tree should not be created yet.
+The large illustrative module tree is still unnecessary.
 
-The slice required only two source modules:
+The synthetic architecture is intentionally concentrated in two source modules:
 
 1. immutable contracts/value objects;
-2. executable decision/evidence/execution pipeline.
+2. executable decision/evidence/execution/replay pipeline.
 
-Separate directories for observer, replay, traces, pending intents, clocks, deliberation, provider integration, or EVE integration would currently be empty ownership shells. They should be added only when an executable contract requires them.
+Separate provider, observer, persistence, or EVE integration packages should be added only when their actual contracts are implemented.
 
-The detailed `SemanticAction.required_facts`, consequence classes, resource claims, retry policies, and generalized predicate objects are also not needed to prove the requested boundary.
+Generic declarative predicate frameworks, large plugin systems, databases, and provider-specific abstractions are still not justified by this slice.
 
-## 7. Missing abstractions
+## 9. Architecture verdict
 
-### Validated evidence capability
+The current synthetic JEVe core appears internally implementable with a single authority path and without circular ownership or a JEV-to-execution shortcut.
 
-A raw `JudgmentBundle` repeatedly appears near the policy boundary, but the stronger concept is “bundle that has passed semantic validation for this policy context.” `ValidatedJudgmentBundle` is the missing capability type.
-
-### Freshness decision contract
-
-Freshness appears in snapshot, question dependencies, result lifecycle, and bundle validation. The architecture should name the owner of the final freshness decision more explicitly. The validator is the natural authority; adapters should report timestamps/dependencies, not decide policy usability.
-
-No other new abstraction was required by this slice.
-
-## 8. Architecture verdict
-
-### Does the current JEVe architecture appear internally implementable as documented?
-
-Yes for the validated core path.
-
-The slice represents the documented boundary without circular ownership, provider concepts in core action types, duplicated mutable state, or a special JEV-to-execution fast path. The deliberate extra types around validation are justified by authority boundaries rather than framework generality.
-
-### Boundaries that should remain unchanged
-
-Keep these invariants unchanged:
+The boundaries that should remain unchanged are:
 
 - exact/mechanical reasoning before JEV;
 - JEV as typed semantic evidence rather than action authority;
-- independent judgments parallelizable by contract;
-- explicit output semantics and calibration;
+- explicit uncertainty and calibration provenance;
+- scheduling concurrency separate from statistical independence;
 - deterministic policy as semantic action authority;
-- explicit unknown/stale/transitional knowledge;
-- fresh-state validation before compilation;
+- complete policy-input binding through execution admission;
+- explicit decision and evidence freshness;
 - semantic actions separate from physical plans;
-- delivery/acceptance/progress/final effect separate;
-- provider/client details behind adapters.
+- pending-intent/resource admission before state-changing dispatch;
+- delivery/acceptance/progress/final effect kept distinct;
+- provider/client volatility isolated behind adapters;
+- replayability of deterministic core decisions.
 
-### Contracts to simplify or correct before broader implementation
+## 10. Next implementation direction
 
-1. Make raw-vs-validated judgment bundles structurally distinct.
-2. Clarify ownership and representation of judgment freshness.
-3. State explicitly that provider failure is evidence absence/failure, not stale semantic evidence.
-4. Keep `required_facts`, generic predicate objects, resource claims, and large module trees illustrative until concrete use cases justify them.
+The next useful increment is a small real-JEV adapter qualification boundary, not EVE observation or physical execution.
 
-## Next implementation direction
+It should prove that a real provider can normalize the following into the existing core contracts without changing deterministic policy semantics:
 
-The next useful increment is not real EVE or a real JEV provider.
+```text
+provider/model/schema identity
+timeout outcomes
+cancellation outcomes
+rate-limit behavior
+batching/multi-output semantics
+partial completion
+calibration provenance input
+wall-clock concurrency behavior
+```
 
-Add replay/trace ownership around the slice and one optional-evidence/short-circuit case, then add pending-intent/resource ownership. Those two increments will test lifecycle and replay claims that this slice does not yet exercise without forcing provider or UI integration.
-
-After those boundaries survive executable tests, a real JEV adapter becomes a reasonable next volatile integration.
+Only after that boundary is qualified should real EVE observation or physical execution integration become the next priority.
