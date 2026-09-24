@@ -6,7 +6,7 @@ This document defines the clean-room boundary for contributors and AI coding age
 
 ## 1. Goal
 
-The goal is not legal formalism. The engineering goal is reproducibility:
+The goal is reproducibility:
 
 > A competent engineer should be able to implement JEVe from this repository, public documentation, and their own observations without access to another implementation's source code.
 
@@ -14,10 +14,12 @@ That requirement improves portability and prevents architectural coupling to acc
 
 ## 2. What may be reused conceptually
 
-The following kinds of ideas are suitable for independent reimplementation:
+The following ideas are suitable for independent reimplementation:
 
-- the separation of observation, decision, validation, and execution;
-- closed candidate sets for bounded model decisions;
+- separation of observation, judgment, deterministic policy, validation, and execution;
+- decomposed semantic questions;
+- concurrent evaluation of independent read-only judgments;
+- typed probabilistic/score/enum/ranking evidence;
 - explicit unknown/stale/transitional state;
 - semantic actions instead of raw input commands;
 - fresh-state validation before execution;
@@ -47,16 +49,15 @@ If a value or behavior is needed, derive it independently from a public contract
 
 ## 4. Architecture vs integration
 
-JEVe separates stable architecture from external integration so clean-room work has a narrow surface.
-
 Stable core:
 
 ```text
 normalized state
 candidate generation
-reduction
-routing
-DecisionRequest / DecisionResponse
+mechanical reduction
+judgment planning
+JudgmentQuestion / JudgmentResult / JudgmentBundle
+deterministic action policy
 fresh-state validation
 semantic action
 execution-plan contract
@@ -69,7 +70,8 @@ External integration:
 ```text
 how EVE state is observed
 how semantic entities are identified
-how JEV is invoked
+how JEV is invoked or batched
+how provider-specific outputs are normalized into judgment contracts
 how physical input is delivered
 how final effects are observed on a real client
 ```
@@ -86,7 +88,7 @@ When implementing an integration, prefer evidence in this order:
 4. clearly labeled inference with fail-closed handling;
 5. unsupported assumptions only as temporary TODOs, never hidden execution premises.
 
-An inference should be represented as inference in design notes and tests until independently established.
+An inference should remain labeled as inference in design notes and tests until independently established.
 
 ## 6. Interface-first workflow
 
@@ -96,13 +98,15 @@ Example:
 
 ```text
 ObserverAdapter
-  -> observe() -> RawObservation
+  -> RawObservation
 
 JEVAdapter
-  -> decide(DecisionRequest) -> DecisionResponse
+  -> JudgmentQuestion or provider-native batch
+  -> JudgmentResult[]
 
 ExecutorAdapter
-  -> dispatch(ExecutionPlan) -> DeliveryResult
+  -> ExecutionPlan
+  -> DeliveryResult
 ```
 
 The exact function names are illustrative. The important point is that the contract is written from JEVe requirements rather than inferred from another repository's implementation shape.
@@ -116,15 +120,13 @@ If another system demonstrates a useful capability, do not inspect its internals
 Bad specification:
 
 ```text
-Implement the same resolver, with the same state machine and the same thresholds.
+Implement the same resolver, state machine, thresholds, and model pipeline.
 ```
 
 Good specification:
 
 ```text
-Given a semantic entity identifier and a fresh normalized snapshot,
-resolve a current physical target only if identity is unique and the evidence
-belongs to the active observation epoch; otherwise return unresolved.
+Given normalized semantic state, derive the set of judgment questions required by current deterministic policy; evaluate independent questions concurrently; reject results that do not satisfy their declared type/freshness contract; and allow only deterministic policy to produce a semantic action.
 ```
 
 The second form can be implemented many ways and exposes the actual invariant.
@@ -165,8 +167,10 @@ For each state-changing operation, document:
 
 ```text
 semantic objective
-required observations
-required human-equivalent judgment
+required exact observations
+semantic judgments required by policy
+judgment output semantics
+policy branch
 preconditions
 semantic action
 physical mapping strategy
@@ -177,37 +181,50 @@ failure modes
 bounded recovery
 ```
 
-Do not start with "what coordinate should be clicked?" Start with "what semantic operation is required, and what evidence proves it?"
+Do not start with "what coordinate should be clicked?" Start with "what semantic operation is required, what is known exactly, what remains judgmental, and what evidence proves the result?"
 
 A client UI path is implementation detail and should be resolved from fresh observation as late as possible.
 
 ## 10. JEV provider clean-room boundary
 
-The core should not assume undocumented details of one JEV transport/provider.
+The core must not assume undocumented details of one JEV transport/provider.
 
 Provider-specific code may know:
 
 - authentication/configuration;
 - request serialization;
-- provider-specific timeout/cancellation behavior;
+- provider-native batching or multi-output features;
+- timeout/cancellation behavior;
 - response parsing;
 - provider metadata.
 
-The core should know only the normalized `DecisionRequest` / `DecisionResponse` semantics.
+The core should know only normalized JEVe semantics:
 
-If a provider cannot express a field such as calibrated confidence, leave it absent rather than manufacturing a value.
+```text
+JudgmentPlan
+JudgmentQuestion
+JudgmentResult
+JudgmentBundle
+```
+
+If a provider cannot express a field such as calibrated probability semantics, leave that capability absent or mark it unknown. Do not manufacture calibration metadata.
+
+Provider-native parallelism may be implemented as one multi-output request or several concurrent requests. The core contract is about independent semantic questions and correlated results, not a particular wire shape.
 
 ## 11. Synthetic-first testing
 
 Before live integration, prove core behavior with synthetic fixtures.
 
-A clean-room implementation should be able to demonstrate:
+A clean-room implementation should demonstrate:
 
-- deterministic elimination without EVE running;
-- model routing with a fake JEV adapter;
-- stale decision rejection;
-- observation epoch invalidation;
-- invalid model output rejection;
+- mechanical-only decisions without EVE running;
+- deterministic generation of judgment questions;
+- parallel scheduling of independent fake judgments;
+- judgment type/range/calibration validation;
+- deterministic policy composition;
+- stale bundle rejection;
+- observation-epoch invalidation;
+- selector mode as evidence rather than authority;
 - outcome verification using simulated state transitions.
 
 This keeps the architecture testable without importing external fixtures.
@@ -221,8 +238,11 @@ Observer
 Normalizer
 CandidateGenerator
 DeterministicReducer
-DecisionRouter
+JudgmentPlanner
+JudgmentScheduler
 JEVAdapter
+JudgmentBundleValidator
+ActionPolicy
 DecisionValidator
 ActionCompiler
 Executor
@@ -249,31 +269,53 @@ A policy default should be labeled as such and should be easy to change.
 
 Do not present an arbitrary copied value as a domain law.
 
-## 14. AI-agent instructions for clean-room work
+## 14. Judgment schemas and domain semantics
+
+Judgment types themselves may contain domain knowledge.
+
+For each non-obvious judgment type, document independently:
+
+```text
+name
+semantic question
+required input feature classes
+output kind
+output semantics
+comparability rules
+calibration assumptions
+freshness dependencies
+known limitations
+```
+
+Do not copy another implementation's hidden judgment taxonomy merely because it appears effective.
+
+## 15. AI-agent instructions for clean-room work
 
 An AI implementing JEVe should follow this sequence:
 
-1. read `README.md`, `docs/ARCHITECTURE.md`, and `docs/DETAILED_DESIGN.md`;
+1. read `README.md`, `docs/ARCHITECTURE.md`, `docs/JEV_JUDGMENT_MODEL.md`, and `docs/DETAILED_DESIGN.md`;
 2. state the invariant being implemented;
-3. define or reuse the JEVe-facing contract;
+3. define or reuse the JEVe-facing semantic contract;
 4. identify which facts are public/documented, directly observed, inferred, or unknown;
 5. implement against synthetic fixtures first;
-6. keep provider/client-specific code behind an adapter;
+6. keep provider/client-specific code behind adapters;
 7. avoid importing names/structures from unrelated repositories;
 8. add a regression fixture for every subtle boundary discovered;
 9. preserve explicit uncertainty and fail-closed behavior;
 10. document any new externally derived assumption.
 
-## 15. Review checklist
+## 16. Review checklist
 
 A clean-room review should ask:
 
 - Can this change be understood using only the JEVe repository and cited public/direct evidence?
 - Does the core depend on an external implementation's private shape?
 - Are foreign identifiers or constants present without independent reason?
-- Are external assumptions isolated behind adapters?
+- Are provider-specific parallel/batching details isolated behind the adapter?
+- Are judgment semantics and calibration assumptions explicit?
+- Are external assumptions isolated behind adapters or configuration?
 - Are unknowns explicitly represented?
-- Could the integration be replaced without changing the decision architecture?
+- Could the JEV provider or EVE integration be replaced without changing action policy semantics?
 - Are synthetic tests sufficient to exercise the core behavior?
 
 If the answer to the first or last two questions is no, the boundary is probably too coupled.
