@@ -2,37 +2,40 @@
 
 This document is the normative architecture description for JEVe.
 
-JEVe separates three concerns that are often incorrectly collapsed into one agent:
+JEVe separates four concerns that are often incorrectly collapsed into one agent:
 
-1. **state interpretation and mechanical decision reduction**;
-2. **bounded semantic choice**;
-3. **validated physical execution**.
+1. **observation and exact mechanical interpretation**;
+2. **probabilistic semantic judgment**;
+3. **deterministic action policy**;
+4. **validated physical execution**.
 
-The architecture is designed so that changing the JEV implementation, the EVE observation source, or the input mechanism does not require rewriting the decision model.
+The architecture is designed so that changing the JEV implementation, the EVE observation source, the action policy, or the physical input mechanism does not require rewriting the other layers.
 
 ## 1. Architectural objective
 
-The objective is not to maximize model usage. It is to minimize the amount of state that requires probabilistic reasoning while retaining good decisions under uncertainty.
+The objective is not to maximize model usage. It is to minimize the amount of state that requires probabilistic reasoning while preserving useful semantic judgment under uncertainty.
 
-The desired control shape is:
+The primary control shape is:
 
 ```text
 observation
   -> normalized state
-  -> valid semantic candidates
-  -> deterministic reduction
-  -> bounded semantic decision when required
+  -> exact facts / constraints / candidate space
+  -> identify unresolved semantic dimensions
+  -> evaluate decomposed JEV judgments
+  -> validate a judgment bundle
+  -> deterministic action policy
   -> fresh-state validation
   -> execution planning
   -> bounded physical action
   -> observed outcome
 ```
 
-The system must preserve the following invariant:
+The system must preserve this invariant:
 
-> **No probabilistic decision creates physical authority.**
+> **No probabilistic judgment creates physical authority.**
 
-A model can select from semantic alternatives. A separate deterministic layer decides whether that selection is still valid and how, or whether, it may be executed.
+A JEV output is semantic evidence. Deterministic policy decides whether the evidence is sufficient and what semantic action, if any, follows from it. A separate fresh-state validator and compiler decide whether that semantic action may become physical execution.
 
 ## 2. Component model
 
@@ -46,17 +49,26 @@ flowchart TD
     SNAP --> GEN[Candidate generator]
     GEN --> RED[Deterministic reducer]
 
-    RED -->|none| MISS[Missing evidence / no valid action]
-    RED -->|one| SEL[Selected semantic action]
-    RED -->|many| ROUTE[Decision router]
+    RED -->|fully decidable| POL[Deterministic action policy]
+    RED -->|semantic uncertainty remains| JPLAN[Judgment planner]
 
-    ROUTE -->|fast semantic ambiguity| JEV[JEV adapter]
-    ROUTE -->|novel / high stakes / low confidence| DELIB[Deliberative adapter]
+    JPLAN --> J1[JEV judgment A]
+    JPLAN --> J2[JEV judgment B]
+    JPLAN --> J3[JEV judgment C]
+    JPLAN --> JN[JEV judgment ...]
 
-    JEV --> SEL
-    DELIB --> SEL
+    J1 --> BUNDLE[Judgment bundle validator]
+    J2 --> BUNDLE
+    J3 --> BUNDLE
+    JN --> BUNDLE
 
-    SEL --> VAL[Fresh-state validator]
+    BUNDLE --> POL
+    POL -->|insufficient / novel / high stakes| DELIB[Deliberative adapter]
+    DELIB --> POL
+
+    POL -->|semantic action| VAL[Fresh-state validator]
+    POL -->|observe more / wait / fail closed| OBS
+
     VAL -->|stale / invalid| OBS
     VAL -->|valid| COMP[Action compiler]
     COMP --> PLAN[Execution plan]
@@ -65,15 +77,17 @@ flowchart TD
     VERIFY --> OBS
 ```
 
-### 2.1 Observer
+The primary architecture is therefore a **deterministic -> probabilistic evidence -> deterministic** sandwich.
+
+## 3. Observer
 
 The Observer acquires evidence about the current EVE state.
 
-It owns acquisition, not interpretation. An observer may read structured client state, an accessibility tree, a screen-derived representation, logs, or a simulator. The architecture does not require one particular source.
+It owns acquisition, not semantic judgment. An observer may read structured client state, an accessibility tree, a screen-derived representation, logs, or a simulator. The architecture does not require one particular source.
 
 Observer output should carry provenance and freshness information whenever possible.
 
-### 2.2 Normalizer
+## 4. Normalizer
 
 The Normalizer converts source-specific observations into a stable domain representation.
 
@@ -84,43 +98,44 @@ Responsibilities:
 - explicit uncertainty;
 - timestamps and observation epoch;
 - source provenance;
-- derived values that are deterministic and cheap;
+- deterministic derived values;
 - rejection of malformed or internally contradictory observations.
 
 The Normalizer must not silently invent missing facts.
 
-### 2.3 Immutable state snapshot
+## 5. Immutable state snapshot
 
-A decision operates on a snapshot rather than a mutable bag of live values.
+A decision cycle operates on a snapshot rather than a mutable bag of live values.
 
-A snapshot must have at least:
+A snapshot must expose at least:
 
 ```text
 snapshot_id
 observation_epoch
+state_epoch
 observed_at
-freshness_deadline or freshness policy
+freshness policy
 facts
 objectives
 constraints
 provenance summary
 ```
 
-The implementation may use persistent/immutable structures or normal objects treated as immutable by contract.
+The implementation may use persistent immutable structures or ordinary objects treated as immutable by contract.
 
-### 2.4 Candidate generator
+## 6. Candidate generator
 
-The Candidate Generator creates the complete set of semantic actions currently authorized by domain rules.
+The Candidate Generator creates semantic actions currently supported and authorized by static domain capability.
 
 It answers:
 
-> "What actions are worth considering?"
+> "Which semantic actions are available to policy?"
 
 It does not answer:
 
 > "Which action should be taken?"
 
-Candidate generation should be deterministic whenever possible. Candidates must be typed and parameterized by stable semantic identifiers, not screen coordinates.
+Candidates are typed and parameterized by semantic identifiers, not physical UI references.
 
 Example:
 
@@ -132,92 +147,286 @@ RETREAT(destination_id)
 ENGAGE_TARGET(entity_id)
 ```
 
-### 2.5 Deterministic reducer
+Candidate generation remains useful even though JEV no longer needs to select directly from the candidate set. It gives deterministic policy a bounded action vocabulary and lets impossible actions be removed before semantic judgment is requested.
 
-The Deterministic Reducer removes candidates that can be rejected without semantic judgment.
+## 7. Deterministic reducer
+
+The Deterministic Reducer removes actions that can be rejected without probabilistic semantic judgment.
 
 Typical reducers include:
 
-- precondition failure;
+- malformed parameters;
+- unavailable capability;
+- failed hard preconditions;
 - hard safety constraints;
-- impossible or unavailable actions;
 - exact resource/capacity limits;
 - deadline constraints;
 - route reachability;
 - known state-machine constraints;
-- strict dominance where one option is no worse on every declared deterministic objective and better on at least one;
-- policy rules explicitly configured by the operator.
+- pending-intent conflicts;
+- strict dominance under declared deterministic dimensions;
+- explicit operator policy.
 
-A reducer must be explainable by a stable reason code.
+Every elimination must have a stable reason code.
 
-If one candidate remains, the system should not call JEV.
+If the remaining state and candidate set are sufficient for deterministic policy to choose an action, JEV should not be called.
 
-If none remain, the correct result is not to improvise. The system should request more evidence, wait, escalate, or fail closed according to policy.
+If uncertainty remains, the unresolved dimensions are passed to the Judgment Planner rather than turning the entire state into one model prompt.
 
-### 2.6 Decision router
+## 8. Judgment planner
 
-The Decision Router determines which reasoning tier owns the remaining ambiguity.
+The Judgment Planner is the bridge between deterministic state and probabilistic semantic evidence.
 
-It should consider:
+It decides **what needs to be judged**, not what action should be taken.
+
+Inputs may include:
 
 ```text
-candidate_count
-state freshness
-stakes
-novelty
+normalized snapshot
+objective
+surviving candidates
+unresolved semantic dimensions
+policy evidence requirements
 latency budget
-available context quality
-confidence requirements
-recent decision stability
 ```
 
-The router is deterministic policy. The reasoning model does not decide whether it is sufficiently trustworthy to receive authority.
+Output is a `JudgmentPlan` containing typed questions such as:
 
-### 2.7 JEV adapter
+```text
+hostile_probability(contact_id)
+route_risk(route_a)
+route_risk(route_b)
+should_disengage(current_context)
+target_preference(target_set)
+```
 
-The JEV Adapter receives a small structured decision problem and returns a bounded semantic result.
+The planner should decompose questions when:
 
-The adapter is provider-specific; the core architecture is not.
+- outputs are semantically distinct;
+- each output can use a smaller feature slice;
+- outputs can be evaluated independently;
+- deterministic policy can compose them afterward.
 
-The request should contain only the context required to distinguish the remaining candidates. The response must be validated against the request.
+The planner must not create artificial decomposition when one judgment is genuinely dependent on another. Dependencies must be explicit.
 
-The JEV result must not introduce an action that was not in the candidate set.
+## 9. JEV judgment adapter
 
-### 2.8 Deliberative adapter
+The JEV adapter evaluates one or more typed semantic questions.
 
-The Deliberative Adapter is optional for an MVP but is an explicit architectural boundary.
+The primary JEVe usage model is evidence generation, not direct action authority.
 
-It is used for cases such as:
+A judgment request binds:
+
+```text
+question_id
+snapshot_id
+observation_epoch
+question kind and semantic meaning
+subject/context identifiers
+compact feature slice
+output contract
+freshness/deadline metadata
+```
+
+A result may return:
+
+```text
+probability
+score
+boolean
+categorical value
+ranking
+distribution
+abstention / insufficient information / error
+```
+
+The output type and scale must be explicit. A numeric output without defined semantics is not safe policy input.
+
+## 10. Parallel judgment execution
+
+Independent judgment questions should be eligible for concurrent execution.
+
+Example:
+
+```text
+Q1 hostile_probability(contact)
+Q2 route_risk(route_a)
+Q3 route_risk(route_b)
+Q4 should_disengage(context)
+```
+
+If these questions do not depend on one another, wall-clock latency should be dominated by the slowest required question rather than the sum of their individual latencies.
+
+The runtime may represent the plan as a dependency graph:
+
+```text
+wave 0: Q1 Q2 Q3 Q4
+wave 1: optional follow-up questions that depend on wave 0
+```
+
+Only independent read-only cognition is parallelized by default. State-changing execution remains separately serialized or resource-controlled.
+
+## 11. Judgment bundle validator
+
+A `JudgmentBundle` is a correlated set of JEV results for one policy evaluation context.
+
+The validator checks:
+
+- result/question correlation;
+- snapshot and observation-epoch binding;
+- schema validity;
+- output range and type;
+- required result presence;
+- calibration semantics where required;
+- freshness;
+- incompatible or contradictory result combinations when the contract defines such constraints.
+
+A partial bundle may be valid only if policy explicitly declares which judgments are optional.
+
+Provider failure must remain provider failure. It must not silently become a guessed value.
+
+## 12. Judgment semantics and calibration
+
+A number is not automatically a probability.
+
+JEVe distinguishes at least:
+
+```text
+PROBABILITY
+SCORE
+BOOLEAN
+ENUM
+RANKING
+DISTRIBUTION
+```
+
+Where applicable, the result also carries calibration status:
+
+```text
+CALIBRATED
+UNCALIBRATED
+UNKNOWN
+```
+
+Policy must not silently compare incompatible scales.
+
+For example:
+
+```text
+0.82 calibrated hostile probability
+```
+
+is not semantically equivalent to:
+
+```text
+0.82 uncalibrated preference score
+```
+
+High-consequence policies may require calibrated probability semantics or may reject evidence whose calibration status is insufficient.
+
+## 13. Deterministic action policy
+
+The Deterministic Action Policy is the authority that converts state and evidence into a semantic branch.
+
+Conceptually:
+
+```text
+Policy(
+  StateSnapshot,
+  ConstraintSet,
+  SurvivingCandidateSet,
+  JudgmentBundle
+) -> PolicyDecision
+```
+
+A `PolicyDecision` may be:
+
+```text
+SELECT(action)
+OBSERVE_MORE(required_evidence)
+DELIBERATE(reason)
+WAIT(reason)
+FAIL_CLOSED(reason)
+```
+
+The policy may use:
+
+- thresholds;
+- rule tables;
+- finite-state logic;
+- deterministic utility calculations;
+- configured weights;
+- hysteresis;
+- explicit risk budgets;
+- candidate dominance after semantic scores become available.
+
+The exact policy is domain-specific, but it must be replayable and deterministic for the same validated inputs and configuration.
+
+### 13.1 Why policy remains deterministic
+
+Keeping final branching in ordinary code provides:
+
+- explicit authority;
+- reproducible behavior;
+- policy review without changing the JEV provider;
+- independent tuning of risk thresholds;
+- easier replay and regression testing;
+- the ability to reject otherwise plausible judgments when hard constraints dominate.
+
+## 14. Closed-candidate selector mode
+
+JEVe permits a secondary selector mode for cases where the unresolved semantic problem is itself a bounded preference among known alternatives.
+
+Example:
+
+```text
+CandidatePreferenceRequest(A, B, C)
+  -> ranking or selected candidate
+```
+
+This mode is not forbidden, but its output is still evidence for deterministic policy rather than immediate action authority.
+
+Policy remains responsible for:
+
+- validating candidate membership;
+- interpreting score/margin semantics;
+- applying stakes-dependent thresholds;
+- checking hard constraints;
+- deciding whether to accept, deliberate, observe more, or fail closed.
+
+Selector mode should not be used merely because it is simpler to prompt. Prefer decomposed judgments when they produce reusable semantic evidence or enable meaningful parallelism.
+
+## 15. Deliberative adapter
+
+The Deliberative Adapter handles cases that do not fit the fast judgment path, such as:
 
 - generating a new multi-step plan;
 - resolving conflicting objectives;
-- decisions whose consequences are high relative to uncertainty;
-- novel states outside the fast-path distribution;
-- deciding which additional observation would reduce uncertainty.
+- interpreting a novel state outside known judgment schemas;
+- identifying which additional observation would reduce uncertainty;
+- high-consequence decisions where the evidence bundle is insufficient.
 
-It must still return through the same semantic-action and validation boundary.
+It must still return into deterministic policy or semantic-action validation. It does not bypass the authority boundary.
 
-### 2.9 Fresh-state validator
+## 16. Fresh-state validator
 
-The validator is the authority boundary between thought and action.
+The validator is the boundary between semantic action selection and physical execution.
 
-Before action compilation it must verify, at minimum:
+Before compilation it verifies, at minimum:
 
-- the selected action existed in the candidate set;
+- the selected action remains in the supported/current candidate space;
 - action parameters are well formed;
 - required preconditions still hold;
-- relevant evidence is still fresh;
-- the observation epoch is compatible;
-- no higher-priority inhibit/safety condition appeared;
-- no equivalent action is already pending when duplicates would be harmful.
+- relevant evidence remains fresh enough;
+- observation epoch is compatible;
+- no higher-priority inhibit appeared;
+- no harmful equivalent intent is already pending.
 
 If validation fails, re-observe. Do not patch the stale decision in place using guessed current state.
 
-### 2.10 Action compiler
+## 17. Action compiler
 
-The Action Compiler converts a semantic action into an implementation-specific `ExecutionPlan`.
-
-This is deliberately separated from semantic choice.
+The Action Compiler converts a validated semantic action into an implementation-specific `ExecutionPlan`.
 
 For example:
 
@@ -225,34 +434,35 @@ For example:
 DOCK(station_id)
 ```
 
-may become:
+may compile into:
 
 ```text
-1. resolve station_id in the current observation epoch
-2. establish required current selection state
+1. resolve station_id in the active observation epoch
+2. establish the required current semantic selection state
 3. issue the smallest bounded command
 4. observe command acceptance
 5. observe progress if applicable
 6. observe final docked state
 ```
 
-The compiler may fail if the semantic objective cannot currently be mapped safely to physical controls.
+The compiler may fail if the semantic objective cannot currently be mapped safely to physical controls. It must not silently select a different semantic action.
 
-### 2.11 Executor
+## 18. Executor
 
-The Executor performs already-authorized physical operations. It does not perform semantic planning.
+The Executor performs already-authorized physical operations. It does not perform semantic planning or reinterpret JEV evidence.
 
-The executor must accept a bounded `ExecutionPlan`, report delivery outcome, and avoid hidden fallback to unrelated mechanisms.
+The executor accepts a bounded execution plan, reports delivery outcome, and avoids hidden fallback to unrelated mechanisms.
 
-For an initial MVP, the executor should be a simulator or test double. Real client integration is not required to prove the architecture.
+For an architecture MVP, the executor should be a simulator or test double.
 
-### 2.12 Outcome verifier
+## 19. Outcome verifier
 
 An issued input is not proof that the intended result occurred.
 
 Where observable, JEVe separates:
 
 ```text
+DELIVERED
 COMMAND_ACCEPTED
 PROGRESSING
 FINAL_EFFECT
@@ -260,17 +470,17 @@ FINAL_EFFECT
 
 Examples:
 
-- input delivery is not necessarily command acceptance;
-- a UI transition is not necessarily the intended final game state;
-- generic state change is not necessarily progress toward the selected objective.
+- transport delivery is not necessarily command acceptance;
+- a UI transition is not necessarily the intended semantic result;
+- generic state change is not necessarily progress toward the objective.
 
 The verifier converts new observation into semantic outcome evidence.
 
-## 3. State semantics
+## 20. State semantics
 
-### 3.1 Explicit knowledge state
+### 20.1 Explicit knowledge state
 
-Boolean-looking facts should support more than two values when observation can be incomplete:
+Boolean-looking facts should support more than two states when observation can be incomplete:
 
 ```text
 KNOWN_TRUE
@@ -280,237 +490,161 @@ STALE
 TRANSITIONAL
 ```
 
-These states have different meanings:
+Reducers and policies must explicitly state which knowledge values they accept.
 
-- `KNOWN_TRUE`: positively observed or deterministically proven true;
-- `KNOWN_FALSE`: positively observed or deterministically proven false;
-- `UNKNOWN`: current evidence cannot establish either side;
-- `STALE`: a formerly known value has exceeded its validity window;
-- `TRANSITIONAL`: the world is expected to be reconstructing and temporary absence is not stable evidence.
-
-Reducers must state which knowledge values they accept.
-
-### 3.2 Observation epoch
+### 20.2 Observation epoch
 
 An observation epoch identifies a coherent observation world.
 
-The epoch should advance when previously resolved physical/UI references must be invalidated as a class, for example after a major session or interface reconstruction.
+The epoch advances when previously resolved physical/UI references must be invalidated as a class, for example after a major session or interface reconstruction.
 
-A coordinate, node, window object, or equivalent physical reference must never outlive the epoch in which it was resolved unless the implementation can independently prove continued validity.
+A semantic identifier may survive an epoch. A coordinate, node, window object, or other physical reference generally may not.
 
-A semantic identifier may survive an epoch. A physical reference generally should not.
+### 20.3 State epoch
 
-### 3.3 State epoch vs observation epoch
-
-Implementations may additionally track a `state_epoch` that increments for meaningful normalized state changes within one coherent observation world.
-
-The distinction is useful:
+An implementation may additionally track a `state_epoch` for meaningful normalized state changes inside one coherent observation world.
 
 ```text
 observation_epoch: invalidates physical evidence classes
 state_epoch: marks ordinary normalized world-state change
 ```
 
-A decision may permit some state-epoch movement if its preconditions are revalidated, while an observation-epoch change should normally force physical re-resolution.
+A judgment or policy decision may tolerate some state-epoch movement only when its declared dependencies remain valid. Observation-epoch changes normally require re-resolution.
 
-## 4. Decision contracts
+## 21. Freshness and cancellation
 
-The core decision relationship is:
+Every judgment is bound to evidence dependencies and a freshness policy.
 
-```text
-DecisionRequest(snapshot, objective, candidates, compact_features)
-    -> DecisionResponse(selected_candidate, confidence, optional_ranking, rationale_tags)
-```
+If a newer snapshot changes a dependency that materially affects an outstanding judgment, the runtime should cancel or invalidate that work when possible.
 
-Normative requirements:
+A stale result may be kept for diagnostics but must not silently enter policy.
 
-1. `selected_candidate` MUST reference an input candidate identifier.
-2. Missing or malformed candidate references MUST fail validation.
-3. Confidence is advisory routing evidence, not physical authority.
-4. A response MUST carry enough correlation data to bind it to the originating snapshot/request.
-5. A response that arrives after its freshness budget expires MUST be revalidated or discarded.
-6. The core implementation MUST be able to replace the JEV adapter with a deterministic test double.
+The runtime may preserve unaffected judgments across a state update only if dependency equivalence is explicitly established. Snapshot identity alone should not force recomputation if the implementation has a sound finer-grained dependency model, but the MVP may conservatively invalidate the whole bundle.
 
-## 5. Decision routing
+## 22. Concurrency model
 
-### 5.1 Fast path
-
-The preferred hot path is:
+The simplest correct model is:
 
 ```text
-observe -> normalize -> reduce -> one candidate -> validate -> execute
+many concurrent read-only observations / features / judgments
+one deterministic policy transaction per controlled context
+resource-bounded state-changing intents
 ```
-
-This avoids model latency entirely.
-
-The JEV hot path is:
-
-```text
-observe -> normalize -> reduce -> small candidate set -> JEV -> validate -> execute
-```
-
-The slow path is:
-
-```text
-observe -> normalize -> reduce -> ambiguity classified as high-risk/novel -> deliberate -> validate -> execute
-```
-
-### 5.2 Confidence and margin
-
-When the adapter can provide scores, confidence alone is insufficient.
-
-A useful ambiguity signal is:
-
-```text
-margin = score(best) - score(second_best)
-```
-
-A result such as `0.51 / 0.49` should normally be treated differently from `0.96 / 0.04`, even though both select the same top candidate.
-
-Thresholds belong to the routing policy and should depend on consequence/stakes.
-
-### 5.3 Novelty
-
-Novelty should be explicit rather than inferred from confidence alone.
-
-Possible novelty signals include:
-
-- missing expected feature groups;
-- unseen categorical values;
-- state combinations absent from replay fixtures;
-- candidate types not previously encountered together;
-- repeated disagreement between JEV choice and deterministic post-validation;
-- unstable flip-flopping between decisions in equivalent states.
-
-Novelty can route to more observation, deliberation, or fail-closed behavior.
-
-## 6. Execution lifecycle
-
-A state-changing semantic action should have a lifecycle similar to:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Proposed
-    Proposed --> Validated
-    Proposed --> Rejected
-    Validated --> Compiled
-    Compiled --> Dispatched
-    Dispatched --> Accepted
-    Dispatched --> FailedDelivery
-    Accepted --> Progressing
-    Accepted --> FinalEffect
-    Progressing --> FinalEffect
-    Progressing --> Stalled
-    Accepted --> Stalled
-    Stalled --> Reobserve
-    FailedDelivery --> Reobserve
-    Rejected --> Reobserve
-    FinalEffect --> [*]
-    Reobserve --> [*]
-```
-
-Retries, if supported, belong to explicit action-specific policy. A generic infinite retry mechanism is outside the architecture.
-
-## 7. Concurrency model
-
-The simplest correct MVP uses one logical decision transaction per controlled client/context.
-
-Passive observation may run continuously, but state-changing execution should be serialized unless an implementation can prove two actions commute safely.
 
 A useful default invariant is:
 
 > At most one unresolved state-changing intent may own a given semantic resource at a time.
 
-Examples of semantic resources might be `navigation`, `target-selection`, or `docking`. The actual resource taxonomy is domain-specific.
+Examples include `navigation`, `target_selection`, or `docking`.
 
-## 8. Performance model
+## 23. Performance model
 
-JEVe should optimize the full decision loop rather than model latency in isolation.
+Measure the whole decision loop rather than only model latency.
 
-Measure at least:
+At minimum track:
 
 ```text
 observation latency
 normalization latency
-candidate-generation latency
-reduction latency
-routing latency
-JEV latency when invoked
-validation latency
-compilation latency
+candidate/reduction latency
+judgment planning latency
+judgment queue latency
+per-judgment latency
+required-bundle wall-clock latency
+parallelism / fan-out
+policy latency
+fresh-validation latency
 execution-delivery latency
 verification latency
 end-to-end decision-to-effect latency
 ```
 
-High-rate passive cognition should not imply high-rate physical mutation.
-
-Recommended optimizations:
-
-- precompute static rule tables;
-- cache deterministic derived features by snapshot/epoch;
-- use compact candidate-local features;
-- avoid serializing large raw observation trees into model prompts;
-- parallelize independent read-only feature calculations;
-- cancel model work when the originating decision becomes stale;
-- deduplicate equivalent pending decisions;
-- log enough data to replay decision behavior offline.
-
-## 9. Promotion of learned judgment into deterministic rules
-
-A repeated JEV decision should not automatically become a hard-coded rule.
-
-Promotion requires an independently stated invariant.
-
-A safe workflow is:
+Useful ratios include:
 
 ```text
-repeated decision pattern
-  -> collect replay evidence
-  -> hypothesize deterministic invariant
-  -> encode rule separately
-  -> verify against positive and adversarial fixtures
-  -> compare against prior JEV behavior
-  -> enable rule with explicit reason code
+mechanical_resolution_rate
+judgment_invocation_rate
+average_questions_per_bundle
+required_bundle_completion_rate
+partial_bundle_rate
+stale_judgment_discard_rate
+selector_mode_rate
 ```
 
-The goal is to lower cost and latency without silently freezing a correlation as if it were a rule.
+Recommended optimization order:
 
-## 10. Traceability
+1. avoid unnecessary judgments through mechanical reasoning;
+2. decompose only the semantic dimensions policy actually needs;
+3. minimize each question's feature slice;
+4. parallelize independent questions;
+5. allow policy short-circuit when all required evidence is already sufficient;
+6. cancel stale optional work;
+7. cache deterministic derived state by safe dependency key;
+8. optimize provider transport/runtime latency;
+9. add speculation only after measurement justifies complexity.
 
-Every decision transaction should be reconstructable from a trace containing at least:
+High-rate cognition must not imply high-rate physical mutation.
+
+## 24. Promotion of judgment into deterministic rules
+
+Repeated JEV output must not automatically become a hard-coded rule.
+
+Promotion requires an independently stated invariant:
 
 ```text
-request_id
+repeated judgment pattern
+  -> collect replay evidence
+  -> hypothesize invariant
+  -> encode deterministic rule separately
+  -> test positive and adversarial fixtures
+  -> compare behavior against prior policy
+  -> enable with explicit reason code
+```
+
+The goal is lower cost and latency without freezing a correlation as if it were a law.
+
+## 25. Traceability
+
+Every policy transaction should be reconstructable from a trace containing at least:
+
+```text
+transaction_id
 snapshot_id
 observation_epoch
 objective
-candidate_ids
-reduction reasons
-route chosen
-model adapter used, if any
-selected candidate
-confidence/margin if available
-validation result
-execution-plan id
+candidate IDs
+mechanical reduction reasons
+judgment plan ID
+judgment question IDs
+per-question result type/status/value metadata
+bundle validation result
+policy branch and reason codes
+deliberative route if used
+selected semantic action if any
+fresh-state validation result
+execution-plan ID
 outcome state
 latency breakdown
 ```
 
-Raw sensitive or unstable source data need not be retained if normalized evidence is sufficient for replay.
+Replay should not require a live EVE client.
 
-## 11. Architectural invariants summary
+## 26. Architectural invariants summary
 
 The following are normative:
 
-1. Mechanical decisions are resolved mechanically when sufficient evidence exists.
-2. JEV receives a closed semantic candidate set on the normal fast path.
-3. JEV cannot directly dispatch physical input.
-4. `UNKNOWN` is not `false`.
-5. State-changing decisions are revalidated against fresh state.
-6. Physical references are invalidated when their observation epoch becomes obsolete.
-7. Input delivery is not final-effect proof.
-8. Equivalent pending actions are not blindly re-issued.
-9. Provider-specific JEV and executor details live behind adapters.
-10. Replayability is part of the design, not an afterthought.
-11. External implementations may vary, but must preserve these semantic boundaries to call themselves JEVe-compatible.
+1. Mechanical facts and decisions are resolved mechanically when sufficient evidence exists.
+2. JEV is primarily a probabilistic semantic evidence generator, not an action authority.
+3. Independent judgment questions are eligible for parallel evaluation.
+4. Judgment output type, scale, freshness, and correlation are explicit.
+5. Numeric scores are not assumed to be calibrated probabilities.
+6. Deterministic policy combines exact state, constraints, candidate space, and validated judgments into semantic actions or non-action routes.
+7. Closed-candidate selector mode is optional and subordinate to deterministic policy.
+8. JEV and deliberative components cannot directly dispatch physical input.
+9. `UNKNOWN`, `STALE`, and `TRANSITIONAL` are not equivalent to false.
+10. State-changing semantic actions are revalidated against fresh state before compilation.
+11. Physical references are invalidated when their observation epoch becomes obsolete.
+12. Input delivery is not final-effect proof.
+13. Equivalent pending actions are not blindly re-issued.
+14. Provider-specific JEV and executor details live behind adapters.
+15. Core behavior and policy composition are replayable with synthetic fixtures.
