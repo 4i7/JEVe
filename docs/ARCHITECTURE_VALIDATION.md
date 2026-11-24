@@ -293,3 +293,7 @@ wall-clock concurrency behavior
 ```
 
 Only after that boundary is qualified should real EVE observation or physical execution integration become the next priority.
+
+## 11. Evidence-boundary regression increment
+
+The validator checks semantic input fingerprints, plan partitions, dependency keys, schema identity and answered completion timestamps. Optional failures are retained as diagnostics and excluded from usable evidence when missing optional results are allowed. Policy checks current snapshot identity, semantic input, epoch and bundle lifetime before consuming evidence. The evidence capability is immutable under ordinary attribute assignment. These checks are application invariants, not a hostile-code security boundary. The synthetic provider still does not establish empirical calibration or network behavior.

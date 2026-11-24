@@ -108,6 +108,8 @@ def judgment_equivalence_key(question: JudgmentQuestion) -> str:
         "calibration_requirement": contract.calibration_requirement.value,
         "abstention_allowed": contract.abstention_allowed,
         "schema_version": question.schema_version,
+        "correlation_key": question.correlation_key,
+        "depends_on": sorted(question.depends_on),
     }
     return _hash_canonical(material)
 
@@ -414,6 +416,7 @@ class JudgmentPlanner:
             optional_question_ids=tuple(
                 q.question_id for q in questions_tuple if q.criticality is Criticality.OPTIONAL
             ),
+            semantic_input_key=semantic_snapshot_key(snapshot),
         )
 
 
@@ -656,55 +659,66 @@ class JudgmentBundleValidator:
         allow_missing_optional: bool = True,
     ) -> BundleValidation:
         reasons: list[BundleReason] = []
+        optional_reasons: list[tuple[str, BundleReason]] = []
         question_by_id = {question.question_id: question for question in plan.questions}
         result_by_id: dict[str, JudgmentResult] = {}
+        seen: set[str] = set()
         valid_until_candidates = [snapshot.fresh_until]
+        required = tuple(q.question_id for q in plan.questions if q.criticality is Criticality.REQUIRED)
+        optional = tuple(q.question_id for q in plan.questions if q.criticality is Criticality.OPTIONAL)
+        if (
+            len(question_by_id) != len(plan.questions)
+            or required != plan.required_question_ids
+            or optional != plan.optional_question_ids
+            or plan.semantic_input_key != semantic_snapshot_key(snapshot)
+        ):
+            reasons.append(BundleReason.PLAN_MISMATCH)
 
         for result in results:
-            if result.question_id in result_by_id:
+            if result.question_id in seen:
                 reasons.append(BundleReason.DUPLICATE_RESULT)
                 continue
-            result_by_id[result.question_id] = result
+            seen.add(result.question_id)
             question = question_by_id.get(result.question_id)
             if question is None:
                 reasons.append(BundleReason.UNKNOWN_QUESTION)
                 continue
-
+            local: list[BundleReason] = []
             if result.snapshot_id != plan.snapshot_id:
-                reasons.append(BundleReason.SNAPSHOT_MISMATCH)
+                local.append(BundleReason.SNAPSHOT_MISMATCH)
             if result.observation_epoch != plan.observation_epoch:
-                reasons.append(BundleReason.OBSERVATION_EPOCH_MISMATCH)
+                local.append(BundleReason.OBSERVATION_EPOCH_MISMATCH)
             if result.equivalence_key != judgment_equivalence_key(question):
-                reasons.append(BundleReason.EQUIVALENCE_KEY_MISMATCH)
+                local.append(BundleReason.EQUIVALENCE_KEY_MISMATCH)
+            if result.dependency_key != judgment_dependency_key(question):
+                local.append(BundleReason.DEPENDENCY_KEY_MISMATCH)
+            if result.schema_version != question.schema_version:
+                local.append(BundleReason.SCHEMA_MISMATCH)
 
             if result.status is ResultStatus.ERROR:
-                reasons.append(BundleReason.PROVIDER_FAILURE)
-                continue
-            if result.status in {ResultStatus.ABSTAIN, ResultStatus.CANCELLED}:
-                if result.status is ResultStatus.ABSTAIN and not question.output_contract.abstention_allowed:
-                    reasons.append(BundleReason.ABSTENTION_NOT_ALLOWED)
-                continue
-            if result.status is not ResultStatus.ANSWERED:
-                continue
+                local.append(BundleReason.PROVIDER_FAILURE)
+            elif result.status is ResultStatus.ABSTAIN and not question.output_contract.abstention_allowed:
+                local.append(BundleReason.ABSTENTION_NOT_ALLOWED)
+            elif result.status is ResultStatus.ANSWERED:
+                valid_until = result.completed_at + self._freshness.max_age
+                if now > valid_until:
+                    local.append(BundleReason.RESULT_STALE)
+                if not snapshot.observed_at <= result.completed_at <= now:
+                    local.append(BundleReason.INVALID_COMPLETION_TIME)
+                self._validate_answer(question, result, local)
 
-            valid_until = result.completed_at + self._freshness.max_age
-            valid_until_candidates.append(valid_until)
-            if now > valid_until:
-                reasons.append(BundleReason.RESULT_STALE)
-            self._validate_answer(question, result, reasons)
+            if local:
+                if question.criticality is Criticality.OPTIONAL and allow_missing_optional:
+                    optional_reasons.extend((result.question_id, reason) for reason in local)
+                else:
+                    reasons.extend(local)
+                continue
+            if result.status is ResultStatus.ANSWERED:
+                result_by_id[result.question_id] = result
+                valid_until_candidates.append(result.completed_at + self._freshness.max_age)
 
-        missing_required = tuple(
-            question_id
-            for question_id in plan.required_question_ids
-            if question_id not in result_by_id
-            or result_by_id[question_id].status is not ResultStatus.ANSWERED
-        )
-        missing_optional = tuple(
-            question_id
-            for question_id in plan.optional_question_ids
-            if question_id not in result_by_id
-            or result_by_id[question_id].status is not ResultStatus.ANSWERED
-        )
+        missing_required = tuple(qid for qid in required if qid not in result_by_id)
+        missing_optional = tuple(qid for qid in optional if qid not in result_by_id)
         if missing_required:
             reasons.append(BundleReason.MISSING_REQUIRED)
         if missing_optional and not allow_missing_optional:
@@ -713,44 +727,37 @@ class JudgmentBundleValidator:
             reasons.append(BundleReason.SNAPSHOT_MISMATCH)
         if snapshot.observation_epoch != plan.observation_epoch:
             reasons.append(BundleReason.OBSERVATION_EPOCH_MISMATCH)
-        if now > snapshot.fresh_until:
+        if not snapshot.observed_at <= now <= snapshot.fresh_until:
             reasons.append(BundleReason.SNAPSHOT_STALE)
 
         bundle = JudgmentBundle(
             plan_id=plan.plan_id,
             snapshot_id=plan.snapshot_id,
             observation_epoch=plan.observation_epoch,
-            results=results,
+            results=tuple(result_by_id[q.question_id] for q in plan.questions if q.question_id in result_by_id),
             missing_required=missing_required,
             missing_optional=missing_optional,
+            semantic_input_key=plan.semantic_input_key,
         )
         unique = tuple(dict.fromkeys(reasons))
+        diagnostics = tuple(optional_reasons)
         stale_reasons = {
             BundleReason.RESULT_STALE,
             BundleReason.SNAPSHOT_STALE,
             BundleReason.OBSERVATION_EPOCH_MISMATCH,
         }
         if any(reason in stale_reasons for reason in unique):
-            return BundleValidation(BundleValidationStatus.STALE, unique, None)
+            return BundleValidation(BundleValidationStatus.STALE, unique, None, diagnostics)
         if unique:
-            return BundleValidation(BundleValidationStatus.INVALID, unique, None)
+            return BundleValidation(BundleValidationStatus.INVALID, unique, None, diagnostics)
 
         status = BundleValidationStatus.PARTIAL if missing_optional else BundleValidationStatus.VALID
-        equivalence_keys = tuple(
-            sorted(
-                (result.question_id, result.equivalence_key)
-                for result in results
-                if result.status is ResultStatus.ANSWERED
-            )
-        )
+        equivalence_keys = tuple(sorted((r.question_id, r.equivalence_key) for r in bundle.results))
         return BundleValidation(
             status,
             (),
-            PolicyUsableJudgmentBundle._issue(
-                bundle,
-                equivalence_keys,
-                min(valid_until_candidates),
-            ),
+            PolicyUsableJudgmentBundle._issue(bundle, equivalence_keys, min(valid_until_candidates)),
+            diagnostics,
         )
 
     def _validate_answer(
@@ -767,7 +774,7 @@ class JudgmentBundleValidator:
             reasons.append(BundleReason.VALUE_MISSING)
             return
         low, high = contract.numeric_range
-        if not low <= result.value <= high:
+        if type(result.value) not in (int, float) or not low <= result.value <= high:
             reasons.append(BundleReason.NUMERIC_RANGE_INVALID)
 
         if contract.calibration_requirement is CalibrationRequirement.CALIBRATED:
@@ -827,7 +834,10 @@ class DeterministicPolicy:
         def consume(question_id: str) -> float | None:
             if bundle is None:
                 return None
-            result = bundle.result(question_id)
+            try:
+                result = bundle.result(question_id)
+            except KeyError:
+                return None
             if result.status is not ResultStatus.ANSWERED or result.value is None:
                 return None
             bindings.append(_binding_from_result(result, bundle.valid_until))
@@ -851,6 +861,17 @@ class DeterministicPolicy:
                 judgment_bindings=tuple(bindings),
             )
 
+        if not snapshot.observed_at <= now <= snapshot.fresh_until:
+            return decision(PolicyStatus.OBSERVE_MORE, None, ("SNAPSHOT_NOT_FRESH",))
+        if bundle is not None and (
+            bundle.bundle.snapshot_id != snapshot.snapshot_id
+            or bundle.bundle.observation_epoch != snapshot.observation_epoch
+            or bundle.bundle.semantic_input_key != semantic_snapshot_key(snapshot)
+            or now > bundle.valid_until
+            or any(r.completed_at > now for r in bundle.bundle.results)
+        ):
+            return decision(PolicyStatus.OBSERVE_MORE, None, ("BUNDLE_NOT_CURRENT",))
+
         if reduction.unresolved_dimensions and bundle is None:
             return decision(PolicyStatus.OBSERVE_MORE, None, ("SEMANTIC_EVIDENCE_REQUIRED",))
 
@@ -862,10 +883,14 @@ class DeterministicPolicy:
             ),
             None,
         )
-        if snapshot.exact_should_disengage.status is KnowledgeStatus.KNOWN:
-            disengage = snapshot.exact_should_disengage.value
-        else:
-            disengage = consume("should-disengage")
+        disengage = None
+        if retreat_candidate is not None:
+            if snapshot.exact_should_disengage.status is KnowledgeStatus.KNOWN:
+                disengage = snapshot.exact_should_disengage.value
+            else:
+                disengage = consume("should-disengage")
+                if disengage is None:
+                    return decision(PolicyStatus.OBSERVE_MORE, None, ("DISENGAGEMENT_EVIDENCE_MISSING",))
         if (
             retreat_candidate is not None
             and disengage is not None
@@ -927,7 +952,7 @@ class FreshStateValidator:
     ) -> FreshValidation:
         if decision.status is not PolicyStatus.SELECTED or decision.selected_action is None:
             return FreshValidation(False, (FreshValidationReason.NOT_SELECTED,), None)
-        if now > decision.expires_at:
+        if not decision.created_at <= now <= decision.expires_at:
             return FreshValidation(False, (FreshValidationReason.DECISION_EXPIRED,), None)
         if fresh_snapshot.observation_epoch != decision.observation_epoch:
             return FreshValidation(
@@ -935,7 +960,7 @@ class FreshStateValidator:
                 (FreshValidationReason.OBSERVATION_EPOCH_CHANGED,),
                 None,
             )
-        if now > fresh_snapshot.fresh_until:
+        if not fresh_snapshot.observed_at <= now <= fresh_snapshot.fresh_until:
             return FreshValidation(False, (FreshValidationReason.FRESH_SNAPSHOT_STALE,), None)
         if semantic_snapshot_key(fresh_snapshot) != decision.semantic_input_key:
             return FreshValidation(False, (FreshValidationReason.SEMANTIC_INPUTS_CHANGED,), None)
@@ -1187,7 +1212,7 @@ def reuse_allowed(
         return False
     if result.status is not ResultStatus.ANSWERED:
         return False
-    if now > result.completed_at + freshness.max_age:
+    if not result.completed_at <= now <= result.completed_at + freshness.max_age:
         return False
     if result.observation_epoch != observation_epoch:
         return False

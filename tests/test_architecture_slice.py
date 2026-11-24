@@ -238,6 +238,53 @@ class ArchitectureCoreTests(unittest.TestCase):
         self.assertIn(BundleReason.PROVIDER_FAILURE, validation.reasons)
         self.assertIn(BundleReason.MISSING_REQUIRED, validation.reasons)
 
+    def test_dependency_schema_and_completion_binding(self):
+        state = snapshot()
+        _, plan, scheduled, _ = self.validated(state)
+        original = scheduled.results[0]
+        for bad, reason in (
+            (replace(original, dependency_key="wrong"), BundleReason.DEPENDENCY_KEY_MISMATCH),
+            (replace(original, schema_version="wrong"), BundleReason.SCHEMA_MISMATCH),
+            (replace(original, completed_at=31), BundleReason.INVALID_COMPLETION_TIME),
+            (replace(original, value=True), BundleReason.NUMERIC_RANGE_INVALID),
+        ):
+            with self.subTest(reason=reason):
+                result = self.validator.validate(state, plan, (bad,) + scheduled.results[1:], now=30)
+                self.assertIsNone(result.validated)
+                self.assertIn(reason, result.reasons)
+
+    def test_plan_and_bundle_bound_to_semantic_inputs(self):
+        state = snapshot()
+        _, plan, scheduled, validation = self.validated(state)
+        changed = replace(state, objective=replace(state.objective, risk_tolerance=0.6))
+        result = self.validator.validate(changed, plan, scheduled.results, now=30)
+        self.assertIn(BundleReason.PLAN_MISMATCH, result.reasons)
+        for other in (changed, replace(state, snapshot_id="other"), replace(state, observation_epoch=8)):
+            reduction, _ = self.reduction_plan(other)
+            decision = self.policy.decide(other, reduction, validation.validated, POLICY_CONFIG, now=30)
+            self.assertIsNone(decision.selected_action)
+
+    def test_optional_provider_failure_is_isolated(self):
+        state = snapshot()
+        reduction, plan = self.reduction_plan(state, optional=True)
+        scripts = ambiguous_scripts()
+        scripts["optional-context-note"] = ScriptedAnswer(ResultStatus.ERROR)
+        results = self.scheduler.execute(plan, FakeJEVAdapter(scripts)).results
+        validation = self.validator.validate(state, plan, results, now=30)
+        self.assertEqual(validation.status, BundleValidationStatus.PARTIAL)
+        self.assertIn(("optional-context-note", BundleReason.PROVIDER_FAILURE), validation.optional_reasons)
+        self.assertEqual(self.policy.decide(state, reduction, validation.validated, POLICY_CONFIG, now=30).status, PolicyStatus.SELECTED)
+        strict = self.validator.validate(state, plan, results, now=30, allow_missing_optional=False)
+        self.assertIsNone(strict.validated)
+
+    def test_expired_bundle_and_immutable_evidence(self):
+        state = snapshot()
+        reduction, _, _, validation = self.validated(state)
+        with self.assertRaises(AttributeError):
+            validation.validated._valid_until = 999
+        decision = self.policy.decide(state, reduction, validation.validated, POLICY_CONFIG, now=121)
+        self.assertIsNone(decision.selected_action)
+
     def test_score_probability_mismatch_rejected(self):
         state = snapshot()
         _, plan = self.reduction_plan(state)

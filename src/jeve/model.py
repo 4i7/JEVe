@@ -218,6 +218,7 @@ class JudgmentPlan:
     questions: tuple[JudgmentQuestion, ...]
     required_question_ids: tuple[str, ...]
     optional_question_ids: tuple[str, ...]
+    semantic_input_key: str
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,7 @@ class JudgmentBundle:
     results: tuple[JudgmentResult, ...]
     missing_required: tuple[str, ...]
     missing_optional: tuple[str, ...]
+    semantic_input_key: str
 
 
 _POLICY_BUNDLE_SEAL = object()
@@ -255,6 +257,14 @@ _POLICY_BUNDLE_SEAL = object()
 
 class PolicyUsableJudgmentBundle:
     __slots__ = ("_bundle", "_equivalence_keys", "_valid_until")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if hasattr(self, name):
+            raise AttributeError("policy evidence is immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("policy evidence is immutable")
 
     def __init__(
         self,
@@ -322,6 +332,10 @@ class BundleReason(str, Enum):
     RESULT_STALE = "RESULT_STALE"
     SNAPSHOT_STALE = "SNAPSHOT_STALE"
     EQUIVALENCE_KEY_MISMATCH = "EQUIVALENCE_KEY_MISMATCH"
+    DEPENDENCY_KEY_MISMATCH = "DEPENDENCY_KEY_MISMATCH"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
+    PLAN_MISMATCH = "PLAN_MISMATCH"
+    INVALID_COMPLETION_TIME = "INVALID_COMPLETION_TIME"
 
 
 @dataclass(frozen=True)
@@ -329,6 +343,7 @@ class BundleValidation:
     status: BundleValidationStatus
     reasons: tuple[BundleReason, ...]
     validated: PolicyUsableJudgmentBundle | None
+    optional_reasons: tuple[tuple[str, BundleReason], ...] = ()
 
 
 class PolicyStatus(str, Enum):
