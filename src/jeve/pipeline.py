@@ -255,6 +255,7 @@ class DeterministicReducer:
             surviving_candidates=tuple(surviving),
             eliminated=tuple(eliminated),
             unresolved_dimensions=tuple(unresolved),
+            semantic_input_key=semantic_snapshot_key(snapshot),
         )
 
     @staticmethod
@@ -321,6 +322,8 @@ class JudgmentPlanner:
         *,
         include_optional_context: bool = False,
     ) -> JudgmentPlan:
+        if reduction.semantic_input_key != semantic_snapshot_key(snapshot):
+            raise ValueError("reduction does not belong to current semantic state")
         questions: list[JudgmentQuestion] = []
 
         for dimension in reduction.unresolved_dimensions:
@@ -848,6 +851,8 @@ class DeterministicPolicy:
     ) -> PolicyDecision:
         now = snapshot.observed_at if now is None else now
         bindings: list[JudgmentBinding] = []
+        semantic_key = semantic_snapshot_key(snapshot)
+        expected_questions: dict[str, JudgmentQuestion] = {}
         routes = {route.route_id: route for route in snapshot.routes}
         surviving = {candidate.candidate_id: candidate for candidate in reduction.surviving_candidates}
 
@@ -858,7 +863,16 @@ class DeterministicPolicy:
                 result = bundle.result(question_id)
             except KeyError:
                 return None
-            if result.status is not ResultStatus.ANSWERED or result.value is None:
+            question = expected_questions.get(question_id)
+            if (
+                question is None
+                or result.status is not ResultStatus.ANSWERED
+                or result.value is None
+                or result.value_kind is not question.output_contract.value_kind
+                or result.schema_version != question.schema_version
+                or result.equivalence_key != judgment_equivalence_key(question)
+                or result.dependency_key != judgment_dependency_key(question)
+            ):
                 return None
             bindings.append(_binding_from_result(result, bundle.valid_until))
             return result.value
@@ -876,24 +890,27 @@ class DeterministicPolicy:
                 observation_epoch=snapshot.observation_epoch,
                 created_at=now,
                 expires_at=min(snapshot.fresh_until, now + config.decision_ttl),
-                semantic_input_key=semantic_snapshot_key(snapshot),
+                semantic_input_key=semantic_key,
                 policy_config_key=config.key,
                 judgment_bindings=tuple(bindings),
             )
 
         if not snapshot.observed_at <= now <= snapshot.fresh_until:
             return decision(PolicyStatus.OBSERVE_MORE, None, ("SNAPSHOT_NOT_FRESH",))
+        if reduction.semantic_input_key != semantic_key:
+            return decision(PolicyStatus.OBSERVE_MORE, None, ("REDUCTION_NOT_CURRENT",))
         if bundle is not None and (
             bundle.bundle.snapshot_id != snapshot.snapshot_id
             or bundle.bundle.observation_epoch != snapshot.observation_epoch
-            or bundle.bundle.semantic_input_key != semantic_snapshot_key(snapshot)
+            or bundle.bundle.semantic_input_key != semantic_key
             or now > bundle.valid_until
             or any(r.completed_at > now for r in bundle.bundle.results)
         ):
             return decision(PolicyStatus.OBSERVE_MORE, None, ("BUNDLE_NOT_CURRENT",))
 
-        if reduction.unresolved_dimensions and bundle is None:
-            return decision(PolicyStatus.OBSERVE_MORE, None, ("SEMANTIC_EVIDENCE_REQUIRED",))
+        if bundle is not None and reduction.unresolved_dimensions:
+            expected_plan = JudgmentPlanner().plan(snapshot, reduction)
+            expected_questions = {q.question_id: q for q in expected_plan.questions}
 
         retreat_candidate = next(
             (
@@ -1065,9 +1082,7 @@ class FreshStateValidator:
             fresh_snapshot,
             self._generator.generate(fresh_snapshot),
         )
-        if action.candidate_id not in {
-            candidate.candidate_id for candidate in current.surviving_candidates
-        }:
+        if action not in current.surviving_candidates:
             return FreshValidation(
                 False,
                 (FreshValidationReason.SELECTED_CANDIDATE_DISAPPEARED,),
@@ -1316,6 +1331,17 @@ class ReplayRunner:
         if trace.policy_config_key != policy_config.key:
             raise ValueError("policy config differs from recorded trace")
 
+        reduction = DeterministicReducer().reduce(
+            trace.snapshot, CandidateGenerator().generate(trace.snapshot)
+        )
+        if reduction != trace.reduction:
+            raise ValueError("reduction diverged during replay")
+        plan = JudgmentPlanner().plan(
+            trace.snapshot, reduction,
+            include_optional_context=bool(trace.judgment_plan.optional_question_ids),
+        )
+        if plan != trace.judgment_plan:
+            raise ValueError("judgment plan diverged during replay")
         freshness = JudgmentFreshnessPolicy(trace.judgment_freshness_max_age)
         validation = JudgmentBundleValidator(freshness, calibration_policy).validate(
             trace.snapshot,
@@ -1328,7 +1354,7 @@ class ReplayRunner:
             raise ValueError("bundle validation status diverged during replay")
         decision = DeterministicPolicy().decide(
             trace.snapshot,
-            trace.reduction,
+            reduction,
             validation.validated,
             policy_config,
             now=trace.policy_decision.created_at,

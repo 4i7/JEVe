@@ -238,6 +238,46 @@ class ArchitectureCoreTests(unittest.TestCase):
         self.assertIn(BundleReason.PROVIDER_FAILURE, validation.reasons)
         self.assertIn(BundleReason.MISSING_REQUIRED, validation.reasons)
 
+    def test_malformed_normalized_state_rejected(self):
+        state = snapshot()
+        for value in (True, float("nan"), -0.1, 1.1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                replace(state.objective, risk_tolerance=value)
+        with self.assertRaises(ValueError):
+            replace(state, routes=(state.routes[0], state.routes[0]))
+        with self.assertRaises(ValueError):
+            replace(state, fresh_until=state.observed_at - 1)
+        with self.assertRaises(ValueError):
+            replace(state.routes[0], exact_risk=Knowledge.known(float("inf")))
+
+    def test_reduction_cannot_cross_semantic_state(self):
+        state = snapshot()
+        reduction, _ = self.reduction_plan(state)
+        changed = replace(state, constraints=HardConstraints(forbidden_route_ids=("A",)))
+        with self.assertRaises(ValueError):
+            self.planner.plan(changed, reduction)
+        self.assertEqual(self.policy.decide(changed, reduction, None, POLICY_CONFIG, now=30).reason_codes, ("REDUCTION_NOT_CURRENT",))
+
+    def test_exact_decisive_branch_needs_no_model_evidence(self):
+        state = snapshot(exact_should_disengage=Knowledge.known(0.95))
+        reduction, _ = self.reduction_plan(state)
+        self.assertTrue(reduction.unresolved_dimensions)
+        decision = self.policy.decide(state, reduction, None, POLICY_CONFIG, now=30)
+        self.assertEqual(decision.selected_action.candidate_id, "RETREAT:safe-harbor")
+        self.assertEqual(decision.judgment_bindings, ())
+
+    def test_policy_rejects_wrong_question_semantics_even_if_validated(self):
+        state = snapshot()
+        reduction, plan = self.reduction_plan(state)
+        question = plan.questions[0]
+        altered = replace(question, output_contract=replace(question.output_contract, semantics="different event"))
+        plan = replace(plan, questions=(altered,) + plan.questions[1:])
+        results = self.scheduler.execute(plan, FakeJEVAdapter(ambiguous_scripts())).results
+        validation = self.validator.validate(state, plan, results, now=30)
+        self.assertIsNotNone(validation.validated)
+        decision = self.policy.decide(state, reduction, validation.validated, POLICY_CONFIG, now=30)
+        self.assertIsNone(decision.selected_action)
+
     def test_dependency_schema_and_completion_binding(self):
         state = snapshot()
         _, plan, scheduled, _ = self.validated(state)
@@ -742,6 +782,13 @@ class ArchitectureCoreTests(unittest.TestCase):
             now=30,
         )
         self.assertEqual(replayed, decision)
+        with self.assertRaisesRegex(ValueError, "reduction diverged"):
+            ReplayRunner().replay(
+                replace(trace, reduction=replace(trace.reduction, unresolved_dimensions=())),
+                calibration_policy=CAL_POLICY,
+                policy_config=POLICY_CONFIG,
+                now=30,
+            )
         with self.assertRaisesRegex(ValueError, "policy config"):
             ReplayRunner().replay(
                 trace,
