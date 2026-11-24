@@ -1107,6 +1107,8 @@ class PendingIntentRegistry:
     def __init__(self) -> None:
         self._pending: dict[str, PendingIntent] = {}
         self._resource_owner: dict[str, str] = {}
+        self._compiled: dict[str, ExecutionPlan] = {}
+        self._dispatched: set[str] = set()
         self._lock = threading.Lock()
         self._sequence = 0
 
@@ -1132,20 +1134,55 @@ class PendingIntentRegistry:
                 self._resource_owner[resource] = intent_id
             return IntentAdmission(IntentAdmissionStatus.ADMITTED, pending)
 
-    def is_current(self, pending: PendingIntent, decision: ValidatedDecision, *, now: int) -> bool:
+    def _is_current_locked(self, pending: PendingIntent, decision: ValidatedDecision, *, now: int) -> bool:
+        return (
+            decision.validated_at <= now <= decision.valid_until
+            and pending.decision == decision
+            and self._pending.get(pending.intent_id) == pending
+            and all(self._resource_owner.get(resource) == pending.intent_id for resource in pending.resource_claims)
+        )
+
+    def register_compilation(
+        self, pending: PendingIntent, decision: ValidatedDecision, plan: ExecutionPlan, *, now: int
+    ) -> None:
         with self._lock:
-            return (
-                decision.validated_at <= now <= decision.valid_until
-                and pending.decision == decision
-                and self._pending.get(pending.intent_id) == pending
-                and all(self._resource_owner.get(resource) == pending.intent_id for resource in pending.resource_claims)
-            )
+            if not self._is_current_locked(pending, decision, now=now):
+                raise ValueError("intent is not current for this validated decision")
+            if (
+                plan.intent_id != pending.intent_id
+                or plan.semantic_action != decision.action
+                or plan.compiled_from_snapshot != decision.validation_snapshot_id
+                or plan.observation_epoch != decision.validation_observation_epoch
+                or plan.resource_claims != pending.resource_claims
+            ):
+                raise ValueError("compiled plan does not match admitted intent")
+            existing = self._compiled.get(pending.intent_id)
+            if existing is not None and existing != plan:
+                raise ValueError("intent already has a different compilation")
+            if pending.intent_id in self._dispatched:
+                raise ValueError("intent has already been dispatched")
+            self._compiled[pending.intent_id] = plan
+
+    def claim_dispatch(self, plan: ExecutionPlan, *, now: int) -> None:
+        with self._lock:
+            pending = self._pending.get(plan.intent_id)
+            if (
+                pending is None
+                or not self._is_current_locked(pending, pending.decision, now=now)
+                or self._compiled.get(plan.intent_id) != plan
+            ):
+                raise ValueError("dispatch requires a current registered compilation")
+            if plan.intent_id in self._dispatched:
+                raise ValueError("intent has already been dispatched")
+            self._dispatched.add(plan.intent_id)
 
     def resolve(self, intent_id: str) -> None:
         with self._lock:
             pending = self._pending.pop(intent_id, None)
             if pending is None:
                 return
+            self._compiled.pop(intent_id, None)
+            self._dispatched.discard(intent_id)
             for resource in pending.resource_claims:
                 if self._resource_owner.get(resource) == intent_id:
                     del self._resource_owner[resource]
@@ -1162,10 +1199,9 @@ class SimulatedActionCompiler:
     ) -> ExecutionPlan:
         if admission.status is not IntentAdmissionStatus.ADMITTED or admission.pending is None:
             raise ValueError("execution requires an admitted pending intent")
-        if not registry.is_current(admission.pending, decision, now=now):
-            raise ValueError("intent is not current for this validated decision")
-        return ExecutionPlan(
-            plan_id=f"exec:{decision.validation_snapshot_id}:{decision.action.candidate_id}",
+        plan = ExecutionPlan(
+            plan_id=f"exec:{admission.pending.intent_id}",
+            intent_id=admission.pending.intent_id,
             semantic_action=decision.action,
             compiled_from_snapshot=decision.validation_snapshot_id,
             observation_epoch=decision.validation_observation_epoch,
@@ -1177,6 +1213,8 @@ class SimulatedActionCompiler:
             ),
             resource_claims=decision.resource_claims,
         )
+        registry.register_compilation(admission.pending, decision, plan, now=now)
+        return plan
 
 
 class SimulatedExecutor:
@@ -1184,11 +1222,13 @@ class SimulatedExecutor:
         self,
         plan: ExecutionPlan,
         *,
+        registry: PendingIntentRegistry,
+        now: int,
         command_accepted: bool,
         progressing: bool,
         final_effect: bool,
     ) -> ExecutionEvidence:
-        _ = plan
+        registry.claim_dispatch(plan, now=now)
         if final_effect:
             command_accepted = True
             progressing = True

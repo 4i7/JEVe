@@ -482,6 +482,7 @@ class PhysicalStep:
 @dataclass(frozen=True)
 class ExecutionPlan:
     plan_id: str
+    intent_id: str
     semantic_action: SemanticAction
     compiled_from_snapshot: str
     observation_epoch: int

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -704,32 +705,57 @@ class ArchitectureCoreTests(unittest.TestCase):
         self.assertIn(("route-risk:B", "ADAPTER_EXCEPTION"), result.failures)
         self.assertIsNone(self.validator.validate(state, plan, result.results, now=30).validated)
 
+    def test_concurrent_intent_admission_has_one_winner(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        registry = PendingIntentRegistry()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            admissions = list(pool.map(lambda _: registry.admit(checked.decision, now=40), range(32)))
+        self.assertEqual(sum(a.status is IntentAdmissionStatus.ADMITTED for a in admissions), 1)
+
     def test_delivery_not_final_effect_and_verified_success(self):
         _, _, _, _, _, checked = self._fresh_validated_decision()
         registry = PendingIntentRegistry()
         admission = registry.admit(checked.decision, now=40)
         plan = SimulatedActionCompiler().compile(checked.decision, admission, registry=registry, now=40)
         executor = SimulatedExecutor()
-        incomplete = OutcomeVerifier().verify(
-            executor.dispatch(
-                plan,
-                command_accepted=False,
-                progressing=False,
-                final_effect=False,
-            )
+        delivered = executor.dispatch(
+            plan, registry=registry, now=40,
+            command_accepted=False, progressing=False, final_effect=False,
         )
+        incomplete = OutcomeVerifier().verify(delivered)
         self.assertFalse(incomplete.success)
         self.assertEqual(incomplete.highest_stage, OutcomeStage.DELIVERED)
-        complete = OutcomeVerifier().verify(
+        # Subsequent observations update evidence; they do not repeat dispatch.
+        with self.assertRaises(ValueError):
             executor.dispatch(
-                plan,
-                command_accepted=True,
-                progressing=True,
-                final_effect=True,
+                plan, registry=registry, now=40,
+                command_accepted=True, progressing=True, final_effect=True,
             )
+        complete = OutcomeVerifier().verify(
+            replace(delivered, command_accepted=True, progressing=True, final_effect=True)
         )
         self.assertTrue(complete.success)
         self.assertEqual(complete.highest_stage, OutcomeStage.FINAL_EFFECT)
+
+    def test_dispatch_rejects_expired_resolved_and_modified_plans(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        decision = checked.decision
+        registry = PendingIntentRegistry()
+        admission = registry.admit(decision, now=40)
+        plan = SimulatedActionCompiler().compile(decision, admission, registry=registry, now=40)
+        executor = SimulatedExecutor()
+        def dispatch(candidate, now):
+            return executor.dispatch(
+                candidate, registry=registry, now=now,
+                command_accepted=False, progressing=False, final_effect=False,
+            )
+        with self.assertRaises(ValueError):
+            dispatch(plan, decision.valid_until + 1)
+        with self.assertRaises(ValueError):
+            dispatch(replace(plan, plan_id="different"), 40)
+        registry.resolve(admission.pending.intent_id)
+        with self.assertRaises(ValueError):
+            dispatch(plan, 40)
 
     def test_trace_replay_reproduces_policy_causality(self):
         state = snapshot()
@@ -756,6 +782,8 @@ class ArchitectureCoreTests(unittest.TestCase):
         outcome = OutcomeVerifier().verify(
             SimulatedExecutor().dispatch(
                 exec_plan,
+                registry=registry,
+                now=40,
                 command_accepted=True,
                 progressing=True,
                 final_effect=True,
