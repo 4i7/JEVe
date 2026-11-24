@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -237,6 +238,93 @@ class ArchitectureCoreTests(unittest.TestCase):
         self.assertEqual(validation.status, BundleValidationStatus.INVALID)
         self.assertIn(BundleReason.PROVIDER_FAILURE, validation.reasons)
         self.assertIn(BundleReason.MISSING_REQUIRED, validation.reasons)
+
+    def test_malformed_normalized_state_rejected(self):
+        state = snapshot()
+        for value in (True, float("nan"), -0.1, 1.1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                replace(state.objective, risk_tolerance=value)
+        with self.assertRaises(ValueError):
+            replace(state, routes=(state.routes[0], state.routes[0]))
+        with self.assertRaises(ValueError):
+            replace(state, fresh_until=state.observed_at - 1)
+        with self.assertRaises(ValueError):
+            replace(state.routes[0], exact_risk=Knowledge.known(float("inf")))
+
+    def test_reduction_cannot_cross_semantic_state(self):
+        state = snapshot()
+        reduction, _ = self.reduction_plan(state)
+        changed = replace(state, constraints=HardConstraints(forbidden_route_ids=("A",)))
+        with self.assertRaises(ValueError):
+            self.planner.plan(changed, reduction)
+        self.assertEqual(self.policy.decide(changed, reduction, None, POLICY_CONFIG, now=30).reason_codes, ("REDUCTION_NOT_CURRENT",))
+
+    def test_exact_decisive_branch_needs_no_model_evidence(self):
+        state = snapshot(exact_should_disengage=Knowledge.known(0.95))
+        reduction, _ = self.reduction_plan(state)
+        self.assertTrue(reduction.unresolved_dimensions)
+        decision = self.policy.decide(state, reduction, None, POLICY_CONFIG, now=30)
+        self.assertEqual(decision.selected_action.candidate_id, "RETREAT:safe-harbor")
+        self.assertEqual(decision.judgment_bindings, ())
+
+    def test_policy_rejects_wrong_question_semantics_even_if_validated(self):
+        state = snapshot()
+        reduction, plan = self.reduction_plan(state)
+        question = plan.questions[0]
+        altered = replace(question, output_contract=replace(question.output_contract, semantics="different event"))
+        plan = replace(plan, questions=(altered,) + plan.questions[1:])
+        results = self.scheduler.execute(plan, FakeJEVAdapter(ambiguous_scripts())).results
+        validation = self.validator.validate(state, plan, results, now=30)
+        self.assertIsNotNone(validation.validated)
+        decision = self.policy.decide(state, reduction, validation.validated, POLICY_CONFIG, now=30)
+        self.assertIsNone(decision.selected_action)
+
+    def test_dependency_schema_and_completion_binding(self):
+        state = snapshot()
+        _, plan, scheduled, _ = self.validated(state)
+        original = scheduled.results[0]
+        for bad, reason in (
+            (replace(original, dependency_key="wrong"), BundleReason.DEPENDENCY_KEY_MISMATCH),
+            (replace(original, schema_version="wrong"), BundleReason.SCHEMA_MISMATCH),
+            (replace(original, completed_at=31), BundleReason.INVALID_COMPLETION_TIME),
+            (replace(original, value=True), BundleReason.NUMERIC_RANGE_INVALID),
+        ):
+            with self.subTest(reason=reason):
+                result = self.validator.validate(state, plan, (bad,) + scheduled.results[1:], now=30)
+                self.assertIsNone(result.validated)
+                self.assertIn(reason, result.reasons)
+
+    def test_plan_and_bundle_bound_to_semantic_inputs(self):
+        state = snapshot()
+        _, plan, scheduled, validation = self.validated(state)
+        changed = replace(state, objective=replace(state.objective, risk_tolerance=0.6))
+        result = self.validator.validate(changed, plan, scheduled.results, now=30)
+        self.assertIn(BundleReason.PLAN_MISMATCH, result.reasons)
+        for other in (changed, replace(state, snapshot_id="other"), replace(state, observation_epoch=8)):
+            reduction, _ = self.reduction_plan(other)
+            decision = self.policy.decide(other, reduction, validation.validated, POLICY_CONFIG, now=30)
+            self.assertIsNone(decision.selected_action)
+
+    def test_optional_provider_failure_is_isolated(self):
+        state = snapshot()
+        reduction, plan = self.reduction_plan(state, optional=True)
+        scripts = ambiguous_scripts()
+        scripts["optional-context-note"] = ScriptedAnswer(ResultStatus.ERROR)
+        results = self.scheduler.execute(plan, FakeJEVAdapter(scripts)).results
+        validation = self.validator.validate(state, plan, results, now=30)
+        self.assertEqual(validation.status, BundleValidationStatus.PARTIAL)
+        self.assertIn(("optional-context-note", BundleReason.PROVIDER_FAILURE), validation.optional_reasons)
+        self.assertEqual(self.policy.decide(state, reduction, validation.validated, POLICY_CONFIG, now=30).status, PolicyStatus.SELECTED)
+        strict = self.validator.validate(state, plan, results, now=30, allow_missing_optional=False)
+        self.assertIsNone(strict.validated)
+
+    def test_expired_bundle_and_immutable_evidence(self):
+        state = snapshot()
+        reduction, _, _, validation = self.validated(state)
+        with self.assertRaises(AttributeError):
+            validation.validated._valid_until = 999
+        decision = self.policy.decide(state, reduction, validation.validated, POLICY_CONFIG, now=121)
+        self.assertIsNone(decision.selected_action)
 
     def test_score_probability_mismatch_rejected(self):
         state = snapshot()
@@ -560,9 +648,9 @@ class ArchitectureCoreTests(unittest.TestCase):
     def test_pending_intent_duplicate_and_resource_conflict(self):
         _, _, _, _, _, checked = self._fresh_validated_decision()
         registry = PendingIntentRegistry()
-        first = registry.admit(checked.decision)
+        first = registry.admit(checked.decision, now=40)
         self.assertEqual(first.status, IntentAdmissionStatus.ADMITTED)
-        duplicate = registry.admit(checked.decision)
+        duplicate = registry.admit(checked.decision, now=40)
         self.assertEqual(
             duplicate.status,
             IntentAdmissionStatus.DUPLICATE_PENDING_INTENT,
@@ -579,39 +667,95 @@ class ArchitectureCoreTests(unittest.TestCase):
             ),
             resource_claims=("navigation",),
         )
-        busy = registry.admit(retreat_decision)
+        busy = registry.admit(retreat_decision, now=40)
         self.assertEqual(busy.status, IntentAdmissionStatus.RESOURCE_BUSY)
 
         registry.resolve(first.pending.intent_id)
-        admitted = registry.admit(retreat_decision)
+        admitted = registry.admit(retreat_decision, now=40)
         self.assertEqual(admitted.status, IntentAdmissionStatus.ADMITTED)
+
+    def test_intent_expiry_resolution_and_non_reuse(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        decision = checked.decision
+        registry = PendingIntentRegistry()
+        self.assertEqual(registry.admit(decision, now=decision.valid_until + 1).status, IntentAdmissionStatus.DECISION_EXPIRED)
+        first = registry.admit(decision, now=40)
+        compiler = SimulatedActionCompiler()
+        with self.assertRaises(ValueError):
+            compiler.compile(decision, first, registry=registry, now=decision.valid_until + 1)
+        registry.resolve(first.pending.intent_id)
+        second = registry.admit(decision, now=40)
+        self.assertNotEqual(first.pending.intent_id, second.pending.intent_id)
+        with self.assertRaises(ValueError):
+            compiler.compile(decision, first, registry=registry, now=40)
+        compiler.compile(decision, second, registry=registry, now=40)
+
+    def test_scheduler_timeout_and_adapter_exception_are_missing_evidence(self):
+        state = snapshot()
+        _, plan = self.reduction_plan(state)
+        scripts = ambiguous_scripts()
+        scripts["route-risk:A"] = replace(scripts["route-risk:A"], block_until_cancel=True)
+        class BrokenAdapter(FakeJEVAdapter):
+            def evaluate(self, plan, question, cancel_event=None):
+                if question.question_id == "route-risk:B":
+                    raise RuntimeError("synthetic failure")
+                return super().evaluate(plan, question, cancel_event)
+        result = JudgmentScheduler(timeout_seconds=0.05).execute(plan, BrokenAdapter(scripts))
+        self.assertIn(("route-risk:A", "DEADLINE_EXCEEDED"), result.failures)
+        self.assertIn(("route-risk:B", "ADAPTER_EXCEPTION"), result.failures)
+        self.assertIsNone(self.validator.validate(state, plan, result.results, now=30).validated)
+
+    def test_concurrent_intent_admission_has_one_winner(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        registry = PendingIntentRegistry()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            admissions = list(pool.map(lambda _: registry.admit(checked.decision, now=40), range(32)))
+        self.assertEqual(sum(a.status is IntentAdmissionStatus.ADMITTED for a in admissions), 1)
 
     def test_delivery_not_final_effect_and_verified_success(self):
         _, _, _, _, _, checked = self._fresh_validated_decision()
         registry = PendingIntentRegistry()
-        admission = registry.admit(checked.decision)
-        plan = SimulatedActionCompiler().compile(checked.decision, admission)
+        admission = registry.admit(checked.decision, now=40)
+        plan = SimulatedActionCompiler().compile(checked.decision, admission, registry=registry, now=40)
         executor = SimulatedExecutor()
-        incomplete = OutcomeVerifier().verify(
-            executor.dispatch(
-                plan,
-                command_accepted=False,
-                progressing=False,
-                final_effect=False,
-            )
+        delivered = executor.dispatch(
+            plan, registry=registry, now=40,
+            command_accepted=False, progressing=False, final_effect=False,
         )
+        incomplete = OutcomeVerifier().verify(delivered)
         self.assertFalse(incomplete.success)
         self.assertEqual(incomplete.highest_stage, OutcomeStage.DELIVERED)
-        complete = OutcomeVerifier().verify(
+        # Subsequent observations update evidence; they do not repeat dispatch.
+        with self.assertRaises(ValueError):
             executor.dispatch(
-                plan,
-                command_accepted=True,
-                progressing=True,
-                final_effect=True,
+                plan, registry=registry, now=40,
+                command_accepted=True, progressing=True, final_effect=True,
             )
+        complete = OutcomeVerifier().verify(
+            replace(delivered, command_accepted=True, progressing=True, final_effect=True)
         )
         self.assertTrue(complete.success)
         self.assertEqual(complete.highest_stage, OutcomeStage.FINAL_EFFECT)
+
+    def test_dispatch_rejects_expired_resolved_and_modified_plans(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        decision = checked.decision
+        registry = PendingIntentRegistry()
+        admission = registry.admit(decision, now=40)
+        plan = SimulatedActionCompiler().compile(decision, admission, registry=registry, now=40)
+        executor = SimulatedExecutor()
+        def dispatch(candidate, now):
+            return executor.dispatch(
+                candidate, registry=registry, now=now,
+                command_accepted=False, progressing=False, final_effect=False,
+            )
+        with self.assertRaises(ValueError):
+            dispatch(plan, decision.valid_until + 1)
+        with self.assertRaises(ValueError):
+            dispatch(replace(plan, plan_id="different"), 40)
+        registry.resolve(admission.pending.intent_id)
+        with self.assertRaises(ValueError):
+            dispatch(plan, 40)
 
     def test_trace_replay_reproduces_policy_causality(self):
         state = snapshot()
@@ -628,14 +772,18 @@ class ArchitectureCoreTests(unittest.TestCase):
             now=40,
         )
         registry = PendingIntentRegistry()
-        admission = registry.admit(fresh_validation.decision)
+        admission = registry.admit(fresh_validation.decision, now=40)
         exec_plan = SimulatedActionCompiler().compile(
             fresh_validation.decision,
             admission,
+            registry=registry,
+            now=40,
         )
         outcome = OutcomeVerifier().verify(
             SimulatedExecutor().dispatch(
                 exec_plan,
+                registry=registry,
+                now=40,
                 command_accepted=True,
                 progressing=True,
                 final_effect=True,
@@ -662,6 +810,13 @@ class ArchitectureCoreTests(unittest.TestCase):
             now=30,
         )
         self.assertEqual(replayed, decision)
+        with self.assertRaisesRegex(ValueError, "reduction diverged"):
+            ReplayRunner().replay(
+                replace(trace, reduction=replace(trace.reduction, unresolved_dimensions=())),
+                calibration_policy=CAL_POLICY,
+                policy_config=POLICY_CONFIG,
+                now=30,
+            )
         with self.assertRaisesRegex(ValueError, "policy config"):
             ReplayRunner().replay(
                 trace,

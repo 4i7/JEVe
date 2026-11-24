@@ -293,3 +293,21 @@ wall-clock concurrency behavior
 ```
 
 Only after that boundary is qualified should real EVE observation or physical execution integration become the next priority.
+
+## 11. Evidence-boundary regression increment
+
+The validator checks semantic input fingerprints, plan partitions, dependency keys, schema identity and answered completion timestamps. Optional failures are retained as diagnostics and excluded from usable evidence when missing optional results are allowed. Policy checks current snapshot identity, semantic input, epoch and bundle lifetime before consuming evidence. The evidence capability is immutable under ordinary attribute assignment. These checks are application invariants, not a hostile-code security boundary. The synthetic provider still does not establish empirical calibration or network behavior.
+
+## 12. Bounded scheduling and simulated admission increment
+
+The scheduler uses a finite wall-clock budget for the whole plan and a configurable worker limit. Required work is submitted first within each wave. Missing dependencies, adapter exceptions and deadline expiry remain missing evidence with explicit scheduler diagnostics. Late work is discarded and cooperative cancellation is requested; Python threads cannot force a provider to terminate and global admission/backoff and real transport deadlines remain unqualified. Scheduler diagnostics are retained in in-memory traces.
+
+Validated decisions carry an explicit admission lifetime. The in-memory intent registry serializes check-and-claim, uses non-repeating IDs within a registry lifetime, and rejects expired decisions. Compilation verifies that the admission is still current in that registry and matches the validated decision. This is a simulated compilation-time check, not proof of atomic real-world dispatch, persistence, or recovery after process restart.
+
+## 13. Normalization, deterministic fast path and replay
+
+Normalized synthetic state rejects duplicate route identifiers, invalid exact probabilities, mutable route/constraint collections and inconsistent timestamp intervals. Reduction records the canonical semantic input key, and planning and policy reject reductions from changed inputs. The synthetic policy verifies consumed evidence against the current planner's expected semantic contract instead of relying only on the result's supplied plan. A mechanically decisive branch can now complete even if unrelated candidate risks remain unresolved; callers should invoke the pre-judgment policy check before scheduling. Replay regenerates reduction and judgment planning from the recorded snapshot and compares both before replaying validated evidence and deterministic policy. This remains an in-memory replay of the canonical synthetic domain, not complete replay of arbitrary custom plans or physical effects.
+
+## 14. Simulated single-dispatch qualification
+
+Compilation is registered against the current in-memory admission and carries its intent identity. The simulated executor atomically claims dispatch against that exact registered plan, rejecting expired, resolved, altered or already-dispatched plans. Later effect observations are evaluated independently rather than reissuing the same dispatch. Concurrent admission is tested with multiple competing calls. The registry deliberately retains unresolved resource ownership until explicit resolution; expiry does not imply the external effect did not occur. This is process-local synthetic qualification only. Crash recovery, external-effect ambiguity, observation provenance, and distributed dispatch atomicity are still unproven.

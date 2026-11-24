@@ -7,6 +7,21 @@ from typing import Generic, TypeVar
 T = TypeVar("T")
 
 
+def _require_probability(value: object, name: str) -> None:
+    if type(value) not in (int, float) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be a number in [0, 1]")
+
+
+def _require_id(value: object, name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+
+
+def _require_nonnegative_int(value: object, name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+
+
 class KnowledgeStatus(str, Enum):
     KNOWN = "KNOWN"
     UNKNOWN = "UNKNOWN"
@@ -20,6 +35,8 @@ class Knowledge(Generic[T]):
     value: T | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, KnowledgeStatus):
+            raise ValueError("invalid knowledge status")
         if self.status is KnowledgeStatus.KNOWN and self.value is None:
             raise ValueError("KNOWN knowledge requires a value")
         if self.status is not KnowledgeStatus.KNOWN and self.value is not None:
@@ -47,11 +64,23 @@ class Objective:
     destination_id: str
     risk_tolerance: float
 
+    def __post_init__(self) -> None:
+        _require_id(self.destination_id, "destination_id")
+        _require_probability(self.risk_tolerance, "risk_tolerance")
+
 
 @dataclass(frozen=True)
 class HardConstraints:
     max_route_length: int | None = None
     forbidden_route_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.max_route_length is not None:
+            _require_nonnegative_int(self.max_route_length, "max_route_length")
+        if type(self.forbidden_route_ids) is not tuple:
+            raise ValueError("forbidden_route_ids must be immutable")
+        for route_id in self.forbidden_route_ids:
+            _require_id(route_id, "forbidden route_id")
 
 
 @dataclass(frozen=True)
@@ -61,6 +90,16 @@ class RouteState:
     length: int
     available: bool
     exact_risk: Knowledge[float]
+
+    def __post_init__(self) -> None:
+        _require_id(self.route_id, "route_id")
+        _require_nonnegative_int(self.length, "route length")
+        if type(self.available) is not bool:
+            raise ValueError("available must be boolean")
+        if self.reachable.status is KnowledgeStatus.KNOWN and type(self.reachable.value) is not bool:
+            raise ValueError("known reachability must be boolean")
+        if self.exact_risk.status is KnowledgeStatus.KNOWN:
+            _require_probability(self.exact_risk.value, "exact_risk")
 
 
 @dataclass(frozen=True)
@@ -76,6 +115,26 @@ class StateSnapshot:
     retreat_destination_id: str | None
     retreat_available: Knowledge[bool]
     exact_should_disengage: Knowledge[float]
+
+    def __post_init__(self) -> None:
+        _require_id(self.snapshot_id, "snapshot_id")
+        _require_nonnegative_int(self.observation_epoch, "observation_epoch")
+        _require_nonnegative_int(self.state_epoch, "state_epoch")
+        _require_nonnegative_int(self.observed_at, "observed_at")
+        _require_nonnegative_int(self.fresh_until, "fresh_until")
+        if self.fresh_until < self.observed_at:
+            raise ValueError("snapshot freshness precedes observation")
+        if type(self.routes) is not tuple:
+            raise ValueError("routes must be immutable")
+        ids = [route.route_id for route in self.routes]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate route identity")
+        if self.retreat_destination_id is not None:
+            _require_id(self.retreat_destination_id, "retreat_destination_id")
+        if self.retreat_available.status is KnowledgeStatus.KNOWN and type(self.retreat_available.value) is not bool:
+            raise ValueError("known retreat availability must be boolean")
+        if self.exact_should_disengage.status is KnowledgeStatus.KNOWN:
+            _require_probability(self.exact_should_disengage.value, "exact_should_disengage")
 
 
 class ActionKind(str, Enum):
@@ -129,6 +188,7 @@ class ReductionResult:
     surviving_candidates: tuple[SemanticAction, ...]
     eliminated: tuple[Elimination, ...]
     unresolved_dimensions: tuple[str, ...]
+    semantic_input_key: str
 
 
 class ValueKind(str, Enum):
@@ -218,6 +278,7 @@ class JudgmentPlan:
     questions: tuple[JudgmentQuestion, ...]
     required_question_ids: tuple[str, ...]
     optional_question_ids: tuple[str, ...]
+    semantic_input_key: str
 
 
 @dataclass(frozen=True)
@@ -248,6 +309,7 @@ class JudgmentBundle:
     results: tuple[JudgmentResult, ...]
     missing_required: tuple[str, ...]
     missing_optional: tuple[str, ...]
+    semantic_input_key: str
 
 
 _POLICY_BUNDLE_SEAL = object()
@@ -255,6 +317,14 @@ _POLICY_BUNDLE_SEAL = object()
 
 class PolicyUsableJudgmentBundle:
     __slots__ = ("_bundle", "_equivalence_keys", "_valid_until")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if hasattr(self, name):
+            raise AttributeError("policy evidence is immutable")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("policy evidence is immutable")
 
     def __init__(
         self,
@@ -322,6 +392,10 @@ class BundleReason(str, Enum):
     RESULT_STALE = "RESULT_STALE"
     SNAPSHOT_STALE = "SNAPSHOT_STALE"
     EQUIVALENCE_KEY_MISMATCH = "EQUIVALENCE_KEY_MISMATCH"
+    DEPENDENCY_KEY_MISMATCH = "DEPENDENCY_KEY_MISMATCH"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
+    PLAN_MISMATCH = "PLAN_MISMATCH"
+    INVALID_COMPLETION_TIME = "INVALID_COMPLETION_TIME"
 
 
 @dataclass(frozen=True)
@@ -329,6 +403,7 @@ class BundleValidation:
     status: BundleValidationStatus
     reasons: tuple[BundleReason, ...]
     validated: PolicyUsableJudgmentBundle | None
+    optional_reasons: tuple[tuple[str, BundleReason], ...] = ()
 
 
 class PolicyStatus(str, Enum):
@@ -387,6 +462,8 @@ class ValidatedDecision:
     validation_snapshot_id: str
     validation_observation_epoch: int
     resource_claims: tuple[str, ...]
+    validated_at: int
+    valid_until: int
 
 
 @dataclass(frozen=True)
@@ -405,6 +482,7 @@ class PhysicalStep:
 @dataclass(frozen=True)
 class ExecutionPlan:
     plan_id: str
+    intent_id: str
     semantic_action: SemanticAction
     compiled_from_snapshot: str
     observation_epoch: int
@@ -438,6 +516,7 @@ class IntentAdmissionStatus(str, Enum):
     ADMITTED = "ADMITTED"
     DUPLICATE_PENDING_INTENT = "DUPLICATE_PENDING_INTENT"
     RESOURCE_BUSY = "RESOURCE_BUSY"
+    DECISION_EXPIRED = "DECISION_EXPIRED"
 
 
 @dataclass(frozen=True)
@@ -445,6 +524,7 @@ class PendingIntent:
     intent_id: str
     action: SemanticAction
     resource_claims: tuple[str, ...]
+    decision: ValidatedDecision
 
 
 @dataclass(frozen=True)
@@ -468,3 +548,5 @@ class DecisionTrace:
     fresh_validation: FreshValidation | None = None
     execution_plan: ExecutionPlan | None = None
     outcome: OutcomeVerification | None = None
+    scheduler_failures: tuple[tuple[str, str], ...] = ()
+    cancelled_optional: tuple[str, ...] = ()
