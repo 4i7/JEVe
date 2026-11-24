@@ -402,6 +402,8 @@ class ValidatedDecision:
     validation_snapshot_id: str
     validation_observation_epoch: int
     resource_claims: tuple[str, ...]
+    validated_at: int
+    valid_until: int
 
 
 @dataclass(frozen=True)
@@ -453,6 +455,7 @@ class IntentAdmissionStatus(str, Enum):
     ADMITTED = "ADMITTED"
     DUPLICATE_PENDING_INTENT = "DUPLICATE_PENDING_INTENT"
     RESOURCE_BUSY = "RESOURCE_BUSY"
+    DECISION_EXPIRED = "DECISION_EXPIRED"
 
 
 @dataclass(frozen=True)
@@ -460,6 +463,7 @@ class PendingIntent:
     intent_id: str
     action: SemanticAction
     resource_claims: tuple[str, ...]
+    decision: ValidatedDecision
 
 
 @dataclass(frozen=True)
@@ -483,3 +487,5 @@ class DecisionTrace:
     fresh_validation: FreshValidation | None = None
     execution_plan: ExecutionPlan | None = None
     outcome: OutcomeVerification | None = None
+    scheduler_failures: tuple[tuple[str, str], ...] = ()
+    cancelled_optional: tuple[str, ...] = ()

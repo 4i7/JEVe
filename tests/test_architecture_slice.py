@@ -607,9 +607,9 @@ class ArchitectureCoreTests(unittest.TestCase):
     def test_pending_intent_duplicate_and_resource_conflict(self):
         _, _, _, _, _, checked = self._fresh_validated_decision()
         registry = PendingIntentRegistry()
-        first = registry.admit(checked.decision)
+        first = registry.admit(checked.decision, now=40)
         self.assertEqual(first.status, IntentAdmissionStatus.ADMITTED)
-        duplicate = registry.admit(checked.decision)
+        duplicate = registry.admit(checked.decision, now=40)
         self.assertEqual(
             duplicate.status,
             IntentAdmissionStatus.DUPLICATE_PENDING_INTENT,
@@ -626,18 +626,49 @@ class ArchitectureCoreTests(unittest.TestCase):
             ),
             resource_claims=("navigation",),
         )
-        busy = registry.admit(retreat_decision)
+        busy = registry.admit(retreat_decision, now=40)
         self.assertEqual(busy.status, IntentAdmissionStatus.RESOURCE_BUSY)
 
         registry.resolve(first.pending.intent_id)
-        admitted = registry.admit(retreat_decision)
+        admitted = registry.admit(retreat_decision, now=40)
         self.assertEqual(admitted.status, IntentAdmissionStatus.ADMITTED)
+
+    def test_intent_expiry_resolution_and_non_reuse(self):
+        _, _, _, _, _, checked = self._fresh_validated_decision()
+        decision = checked.decision
+        registry = PendingIntentRegistry()
+        self.assertEqual(registry.admit(decision, now=decision.valid_until + 1).status, IntentAdmissionStatus.DECISION_EXPIRED)
+        first = registry.admit(decision, now=40)
+        compiler = SimulatedActionCompiler()
+        with self.assertRaises(ValueError):
+            compiler.compile(decision, first, registry=registry, now=decision.valid_until + 1)
+        registry.resolve(first.pending.intent_id)
+        second = registry.admit(decision, now=40)
+        self.assertNotEqual(first.pending.intent_id, second.pending.intent_id)
+        with self.assertRaises(ValueError):
+            compiler.compile(decision, first, registry=registry, now=40)
+        compiler.compile(decision, second, registry=registry, now=40)
+
+    def test_scheduler_timeout_and_adapter_exception_are_missing_evidence(self):
+        state = snapshot()
+        _, plan = self.reduction_plan(state)
+        scripts = ambiguous_scripts()
+        scripts["route-risk:A"] = replace(scripts["route-risk:A"], block_until_cancel=True)
+        class BrokenAdapter(FakeJEVAdapter):
+            def evaluate(self, plan, question, cancel_event=None):
+                if question.question_id == "route-risk:B":
+                    raise RuntimeError("synthetic failure")
+                return super().evaluate(plan, question, cancel_event)
+        result = JudgmentScheduler(timeout_seconds=0.05).execute(plan, BrokenAdapter(scripts))
+        self.assertIn(("route-risk:A", "DEADLINE_EXCEEDED"), result.failures)
+        self.assertIn(("route-risk:B", "ADAPTER_EXCEPTION"), result.failures)
+        self.assertIsNone(self.validator.validate(state, plan, result.results, now=30).validated)
 
     def test_delivery_not_final_effect_and_verified_success(self):
         _, _, _, _, _, checked = self._fresh_validated_decision()
         registry = PendingIntentRegistry()
-        admission = registry.admit(checked.decision)
-        plan = SimulatedActionCompiler().compile(checked.decision, admission)
+        admission = registry.admit(checked.decision, now=40)
+        plan = SimulatedActionCompiler().compile(checked.decision, admission, registry=registry, now=40)
         executor = SimulatedExecutor()
         incomplete = OutcomeVerifier().verify(
             executor.dispatch(
@@ -675,10 +706,12 @@ class ArchitectureCoreTests(unittest.TestCase):
             now=40,
         )
         registry = PendingIntentRegistry()
-        admission = registry.admit(fresh_validation.decision)
+        admission = registry.admit(fresh_validation.decision, now=40)
         exec_plan = SimulatedActionCompiler().compile(
             fresh_validation.decision,
             admission,
+            registry=registry,
+            now=40,
         )
         outcome = OutcomeVerifier().verify(
             SimulatedExecutor().dispatch(

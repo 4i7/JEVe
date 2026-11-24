@@ -297,3 +297,9 @@ Only after that boundary is qualified should real EVE observation or physical ex
 ## 11. Evidence-boundary regression increment
 
 The validator checks semantic input fingerprints, plan partitions, dependency keys, schema identity and answered completion timestamps. Optional failures are retained as diagnostics and excluded from usable evidence when missing optional results are allowed. Policy checks current snapshot identity, semantic input, epoch and bundle lifetime before consuming evidence. The evidence capability is immutable under ordinary attribute assignment. These checks are application invariants, not a hostile-code security boundary. The synthetic provider still does not establish empirical calibration or network behavior.
+
+## 12. Bounded scheduling and simulated admission increment
+
+The scheduler uses a finite wall-clock budget for the whole plan and a configurable worker limit. Required work is submitted first within each wave. Missing dependencies, adapter exceptions and deadline expiry remain missing evidence with explicit scheduler diagnostics. Late work is discarded and cooperative cancellation is requested; Python threads cannot force a provider to terminate and global admission/backoff and real transport deadlines remain unqualified. Scheduler diagnostics are retained in in-memory traces.
+
+Validated decisions carry an explicit admission lifetime. The in-memory intent registry serializes check-and-claim, uses non-repeating IDs within a registry lifetime, and rejects expired decisions. Compilation verifies that the admission is still current in that registry and matches the validated decision. This is a simulated compilation-time check, not proof of atomic real-world dispatch, persistence, or recovery after process restart.

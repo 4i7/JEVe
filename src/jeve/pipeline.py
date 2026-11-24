@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from hashlib import sha256
-from time import sleep
+from time import monotonic, sleep
+from math import isfinite
 from typing import Callable
 
 from .model import (
@@ -526,11 +527,22 @@ class ScheduledJudgments:
     waves: tuple[tuple[str, ...], ...]
     results: tuple[JudgmentResult, ...]
     cancelled_optional: tuple[str, ...] = ()
+    failures: tuple[tuple[str, str], ...] = ()
 
 
 class JudgmentScheduler:
+    def __init__(self, *, max_workers: int = 8, timeout_seconds: float = 5.0) -> None:
+        if type(max_workers) is not int or max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
+        if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        self.max_workers = max_workers
+        self.timeout_seconds = timeout_seconds
+
     def build_waves(self, plan: JudgmentPlan) -> tuple[tuple[str, ...], ...]:
         pending = {question.question_id: question for question in plan.questions}
+        if len(pending) != len(plan.questions):
+            raise ValueError("duplicate judgment question identity")
         completed: set[str] = set()
         waves: list[tuple[str, ...]] = []
         while pending:
@@ -554,32 +566,7 @@ class JudgmentScheduler:
         plan: JudgmentPlan,
         adapter: FakeJEVAdapter,
     ) -> ScheduledJudgments:
-        waves = self.build_waves(plan)
-        question_by_id = {q.question_id: q for q in plan.questions}
-        result_by_id: dict[str, JudgmentResult] = {}
-
-        for wave in waves:
-            with ThreadPoolExecutor(max_workers=max(1, len(wave))) as executor:
-                futures = {
-                    question_id: executor.submit(
-                        adapter.evaluate,
-                        plan,
-                        question_by_id[question_id],
-                        None,
-                    )
-                    for question_id in wave
-                }
-                for question_id in wave:
-                    result_by_id[question_id] = futures[question_id].result()
-
-        return ScheduledJudgments(
-            waves=waves,
-            results=tuple(
-                result_by_id[q.question_id]
-                for q in plan.questions
-                if q.question_id in result_by_id
-            ),
-        )
+        return self._execute(plan, adapter, sufficient=None)
 
     def execute_until_policy_sufficient(
         self,
@@ -588,55 +575,88 @@ class JudgmentScheduler:
         sufficient: Callable[[tuple[JudgmentResult, ...]], bool],
     ) -> ScheduledJudgments:
         if any(question.depends_on for question in plan.questions):
-            raise ValueError("short-circuit draft currently supports one independent wave")
+            raise ValueError("short-circuit currently supports one independent wave")
+        return self._execute(plan, adapter, sufficient=sufficient)
 
-        cancel_event = threading.Event()
-        question_by_id = {q.question_id: q for q in plan.questions}
-        required = tuple(plan.required_question_ids)
-        optional = tuple(plan.optional_question_ids)
+    def _execute(self, plan, adapter, *, sufficient) -> ScheduledJudgments:
+        waves = self.build_waves(plan)
+        if not waves:
+            return ScheduledJudgments((), ())
+        questions = {q.question_id: q for q in plan.questions}
         results: dict[str, JudgmentResult] = {}
+        failures: dict[str, str] = {}
+        cancelled: list[str] = []
+        deadline = monotonic() + self.timeout_seconds
+        cancellation = threading.Event()
+        executor = ThreadPoolExecutor(max_workers=self.max_workers)
 
-        executor = ThreadPoolExecutor(max_workers=max(1, len(plan.questions)))
-        try:
-            futures = {
-                question.question_id: executor.submit(
-                    adapter.evaluate,
-                    plan,
-                    question,
-                    cancel_event if question.criticality is Criticality.OPTIONAL else None,
-                )
-                for question in plan.questions
-            }
-            for question_id in required:
-                results[question_id] = futures[question_id].result()
-
-            cancelled: list[str] = []
-            if sufficient(tuple(results[qid] for qid in required)):
-                cancel_event.set()
-                for question_id in optional:
-                    future = futures[question_id]
+        def collect(futures, ids):
+            if not ids:
+                return
+            done, _ = wait(
+                [futures[qid] for qid in ids],
+                timeout=max(0.0, deadline - monotonic()),
+            )
+            for qid in ids:
+                future = futures[qid]
+                if future not in done:
+                    failures[qid] = "DEADLINE_EXCEEDED"
                     future.cancel()
-                    cancelled.append(question_id)
-            else:
-                for question_id in optional:
-                    results[question_id] = futures[question_id].result()
+                else:
+                    try:
+                        results[qid] = future.result()
+                    except Exception:
+                        failures[qid] = "ADAPTER_EXCEPTION"
 
-            for question_id in optional:
-                if question_id not in results and futures[question_id].done() and not futures[question_id].cancelled():
-                    result = futures[question_id].result()
-                    if result.status is not ResultStatus.CANCELLED:
-                        results[question_id] = result
-
+        try:
+            for wave in waves:
+                ready = []
+                for qid in wave:
+                    if monotonic() >= deadline:
+                        failures[qid] = "DEADLINE_EXCEEDED"
+                    elif any(
+                        dep not in results or results[dep].status is not ResultStatus.ANSWERED
+                        for dep in questions[qid].depends_on
+                    ):
+                        failures[qid] = "DEPENDENCY_UNAVAILABLE"
+                    else:
+                        ready.append(qid)
+                # Required work gets priority when workers are saturated.
+                ready.sort(key=lambda qid: (questions[qid].criticality is Criticality.OPTIONAL, qid))
+                futures = {
+                    qid: executor.submit(adapter.evaluate, plan, questions[qid], cancellation)
+                    for qid in ready
+                }
+                if sufficient is None:
+                    collect(futures, ready)
+                    continue
+                required = [qid for qid in ready if questions[qid].criticality is Criticality.REQUIRED]
+                optional = [qid for qid in ready if questions[qid].criticality is Criticality.OPTIONAL]
+                collect(futures, required)
+                required_complete = all(
+                    qid in results and results[qid].status is ResultStatus.ANSWERED
+                    for qid in plan.required_question_ids
+                )
+                if required_complete and sufficient(tuple(results[qid] for qid in plan.required_question_ids)):
+                    completed = [qid for qid in optional if futures[qid].done()]
+                    collect(futures, completed)
+                    for qid in optional:
+                        if qid not in completed:
+                            cancelled.append(qid)
+                            futures[qid].cancel()
+                    cancellation.set()
+                else:
+                    collect(futures, optional)
             return ScheduledJudgments(
-                waves=(tuple(sorted(question_by_id)),),
-                results=tuple(
-                    results[q.question_id]
-                    for q in plan.questions
-                    if q.question_id in results
-                ),
+                waves=waves,
+                results=tuple(results[q.question_id] for q in plan.questions if q.question_id in results),
                 cancelled_optional=tuple(cancelled),
+                failures=tuple((q.question_id, failures[q.question_id]) for q in plan.questions if q.question_id in failures),
             )
         finally:
+            cancellation.set()
+            # A Python thread cannot forcibly stop a provider. Late results are
+            # discarded; adapters must honor cancellation and transport timeouts.
             executor.shutdown(wait=False, cancel_futures=True)
 
 
@@ -1062,6 +1082,8 @@ class FreshStateValidator:
                 validation_snapshot_id=fresh_snapshot.snapshot_id,
                 validation_observation_epoch=fresh_snapshot.observation_epoch,
                 resource_claims=action.resource_claims,
+                validated_at=now,
+                valid_until=min(decision.expires_at, fresh_snapshot.fresh_until, *(b.valid_until for b in decision.judgment_bindings)),
             ),
         )
 
@@ -1070,43 +1092,48 @@ class PendingIntentRegistry:
     def __init__(self) -> None:
         self._pending: dict[str, PendingIntent] = {}
         self._resource_owner: dict[str, str] = {}
+        self._lock = threading.Lock()
+        self._sequence = 0
 
-    def admit(self, decision: ValidatedDecision) -> IntentAdmission:
-        action = decision.action
-        equivalent = next(
-            (
-                pending
-                for pending in self._pending.values()
-                if pending.action.candidate_id == action.candidate_id
-            ),
-            None,
-        )
-        if equivalent is not None:
-            return IntentAdmission(IntentAdmissionStatus.DUPLICATE_PENDING_INTENT, None)
-
-        if any(resource in self._resource_owner for resource in decision.resource_claims):
-            return IntentAdmission(IntentAdmissionStatus.RESOURCE_BUSY, None)
-
-        intent_id = _hash_canonical(
-            {
+    def admit(self, decision: ValidatedDecision, *, now: int) -> IntentAdmission:
+        with self._lock:
+            if not decision.validated_at <= now <= decision.valid_until:
+                return IntentAdmission(IntentAdmissionStatus.DECISION_EXPIRED, None)
+            action = decision.action
+            if any(pending.action.candidate_id == action.candidate_id for pending in self._pending.values()):
+                return IntentAdmission(IntentAdmissionStatus.DUPLICATE_PENDING_INTENT, None)
+            if any(resource in self._resource_owner for resource in decision.resource_claims):
+                return IntentAdmission(IntentAdmissionStatus.RESOURCE_BUSY, None)
+            self._sequence += 1
+            intent_id = _hash_canonical({
                 "snapshot": decision.validation_snapshot_id,
                 "epoch": decision.validation_observation_epoch,
                 "candidate": action.candidate_id,
-            }
-        )
-        pending = PendingIntent(intent_id, action, decision.resource_claims)
-        self._pending[intent_id] = pending
-        for resource in pending.resource_claims:
-            self._resource_owner[resource] = intent_id
-        return IntentAdmission(IntentAdmissionStatus.ADMITTED, pending)
+                "sequence": self._sequence,
+            })
+            pending = PendingIntent(intent_id, action, decision.resource_claims, decision)
+            self._pending[intent_id] = pending
+            for resource in pending.resource_claims:
+                self._resource_owner[resource] = intent_id
+            return IntentAdmission(IntentAdmissionStatus.ADMITTED, pending)
+
+    def is_current(self, pending: PendingIntent, decision: ValidatedDecision, *, now: int) -> bool:
+        with self._lock:
+            return (
+                decision.validated_at <= now <= decision.valid_until
+                and pending.decision == decision
+                and self._pending.get(pending.intent_id) == pending
+                and all(self._resource_owner.get(resource) == pending.intent_id for resource in pending.resource_claims)
+            )
 
     def resolve(self, intent_id: str) -> None:
-        pending = self._pending.pop(intent_id, None)
-        if pending is None:
-            return
-        for resource in pending.resource_claims:
-            if self._resource_owner.get(resource) == intent_id:
-                del self._resource_owner[resource]
+        with self._lock:
+            pending = self._pending.pop(intent_id, None)
+            if pending is None:
+                return
+            for resource in pending.resource_claims:
+                if self._resource_owner.get(resource) == intent_id:
+                    del self._resource_owner[resource]
 
 
 class SimulatedActionCompiler:
@@ -1114,11 +1141,14 @@ class SimulatedActionCompiler:
         self,
         decision: ValidatedDecision,
         admission: IntentAdmission,
+        *,
+        registry: PendingIntentRegistry,
+        now: int,
     ) -> ExecutionPlan:
         if admission.status is not IntentAdmissionStatus.ADMITTED or admission.pending is None:
             raise ValueError("execution requires an admitted pending intent")
-        if admission.pending.action != decision.action:
-            raise ValueError("intent action does not match validated decision")
+        if not registry.is_current(admission.pending, decision, now=now):
+            raise ValueError("intent is not current for this validated decision")
         return ExecutionPlan(
             plan_id=f"exec:{decision.validation_snapshot_id}:{decision.action.candidate_id}",
             semantic_action=decision.action,
@@ -1267,6 +1297,8 @@ class TraceRecorder:
             fresh_validation=fresh_validation,
             execution_plan=execution_plan,
             outcome=outcome,
+            scheduler_failures=scheduled.failures,
+            cancelled_optional=scheduled.cancelled_optional,
         )
 
 
